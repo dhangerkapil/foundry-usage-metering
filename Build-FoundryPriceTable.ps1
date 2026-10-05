@@ -50,22 +50,43 @@
 #
 # meterName is abbreviated, inconsistent between model families, and in one
 # case actively misleading: 'opt' means OUTPUT, not "optional" or "optimised".
-# A parser that guesses will mis-key output tokens as something else and
-# silently under-bill, because output is typically 4-6x the input rate.
+# A parser that guesses will mis-key output tokens and silently under-bill,
+# because output is typically 4-6x the input rate.
+#
+# The naming is NOT tokenised consistently, so matching on whitespace-split
+# tokens is too brittle. All four of these appear in one region:
+#
+#     ... Inp DZone Tokens          single token
+#     ... Inp Data Zone Tokens      TWO words
+#     ... BatchOutp DataZone Tokens concatenated, and one-word DataZone
+#     ... txt-out-glbl Tokens       hyphen separated, 'out' not 'outp'
+#
+# So matching is regex-based against the whole normalised name, with word
+# boundaries where a short token could otherwise match inside another word.
 # ---------------------------------------------------------------------------
 
-$script:ScopeTokens = @{
-    'glbl' = 'Global'; 'gl' = 'Global'; 'global' = 'Global'
-    'dz'   = 'DataZone'; 'dzone' = 'DataZone'
-    'regnl'= 'Regional'; 'regional' = 'Regional'
+# Order matters, first match wins.
+#   CacheWrite before CachedInput: a cache-write meter reads 'Cd Wr', which also
+#     contains the cached marker. These are NOT the same price - verified on
+#     gpt-5.6-sol long context: Cd Wr = $20.00/1M, Cd Inp = $1.60/1M. 12.5x apart.
+#     Collapsing them into one Kind makes the cache key collide and the winner
+#     arbitrary, so cache reads can be billed at 12.5x or writes at 1/12.5x.
+#   CachedInput before Input: a cached-input meter also contains 'Inp'.
+# Cached has four spellings in the wild: cach, cchd, cched, cd.
+$script:KindPatterns = [ordered]@{
+    'CacheWrite'  = 'cache\s*write|\bwr\b|\bcw\b'
+    'CachedInput' = 'cach|cchd|cched|\bcd\b'
+    'Output'      = 'outp|output|\bout\b|\bopt\b'
+    'Input'       = 'inp|input|\bin\b'
 }
 
-$script:KindTokens = @{
-    'inp'    = 'Input';  'input' = 'Input'
-    'outp'   = 'Output'; 'output' = 'Output'
-    'opt'    = 'Output'      # NOT "optional" - verified against price ratios
-    'cached' = 'CachedInput'; 'cache' = 'CachedInput'
-    'cchd'   = 'CachedInput'; 'cd' = 'CachedInput'
+# Data Zone has FIVE spellings: 'Data Zone', 'DataZone', 'DZone', 'DZn', 'DZ'.
+# Any one missed silently falls through to the Global default, a 10% under-bill
+# (verified: gpt-4.1 Global $2.00 vs Data Zone $2.20).
+$script:ScopePatterns = [ordered]@{
+    'DataZone' = 'data\s*zone|dzone|\bdzn\b|\bdz\b'
+    'Regional' = 'regnl|regional|\brgnl\b'
+    'Global'   = 'glbl|global|\bgl\b'
 }
 
 # Publishers that do not bill through the Retail Prices API at all.
@@ -97,42 +118,56 @@ function ConvertTo-MeterAttributes {
     #>
     param([string] $MeterName, [string] $UnitOfMeasure, [double] $RetailPrice)
 
-    $words = $MeterName -split '[\s\-]+' | Where-Object { $_ }
-    $lower = $words | ForEach-Object { $_.ToLowerInvariant() }
+    # Normalise separators so hyphenated and concatenated forms behave the same.
+    $n = ($MeterName -replace '[\-_]', ' ' -replace '\s+', ' ').Trim().ToLowerInvariant()
 
-    $scope = 'Global'      # meters with no scope token are Global in practice
-    $kind  = $null
-    foreach ($w in $lower) {
-        if ($script:ScopeTokens.ContainsKey($w)) { $scope = $script:ScopeTokens[$w] }
-        # First kind token wins: "Cached Inp" must resolve to CachedInput,
-        # not be overwritten by the Inp that follows it.
-        if (-not $kind -and $script:KindTokens.ContainsKey($w)) { $kind = $script:KindTokens[$w] }
-    }
-    # "Cached Inp" / "Cache Inp" - the cached marker precedes the input marker
-    if ($lower -contains 'cached' -or $lower -contains 'cache' -or $lower -contains 'cchd') {
-        $kind = 'CachedInput'
+    $scope = 'Global'      # meters carrying no scope marker are Global in practice
+    foreach ($s in $script:ScopePatterns.Keys) {
+        if ($n -match $script:ScopePatterns[$s]) { $scope = $s; break }
     }
 
-    # Context tier. A bare 'L' token means long context (verified: exactly 2x base).
+    $kind = $null
+    foreach ($k in $script:KindPatterns.Keys) {
+        if ($n -match $script:KindPatterns[$k]) { $kind = $k; break }
+    }
+
+    # Context tier. Abbreviated as LoCo / ShCo as well as LongCo / ShortCo, and
+    # a bare 'l'. Long context is verified at exactly 2x base, so a missed
+    # marker is a 50% under-bill.
     $contextTier = 'Standard'
-    if ($lower -contains 'longco' -or $lower -contains 'l') { $contextTier = 'Long' }
-    elseif ($lower -contains 'shortco')                     { $contextTier = 'Short' }
+    if     ($n -match 'longco|\bloco\b|\blong\b|\bl\b')  { $contextTier = 'Long' }
+    elseif ($n -match 'shortco|\bshco\b|\bshort\b')      { $contextTier = 'Short' }
 
-    # Deployment type. Batch is verified at exactly 50% of standard.
+    # Service / deployment tier. Batch is verified at exactly 50% of standard.
+    # 'PP' is Priority Processing, verified at exactly 2x standard across all
+    # four kinds - it is NOT Provisioned/PTU. PTU is capacity billed hourly
+    # ('1/Hour'), so it never appears as a per-token meter at all.
+    # 'Flex' / 'Fl' is a third tier and must not collide with Standard.
     $deploymentType = 'Standard'
-    if     ($lower -contains 'batch') { $deploymentType = 'Batch' }
-    elseif ($lower -contains 'pp')    { $deploymentType = 'Provisioned' }
-    elseif ($lower -contains 'ft')    { $deploymentType = 'FineTuned' }
+    if     ($n -match 'batch')                       { $deploymentType = 'Batch' }
+    elseif ($n -match '\bflex\b|\bfl\b')             { $deploymentType = 'Flex' }
+    elseif ($n -match '\bpp\b')                      { $deploymentType = 'Priority' }
+    elseif ($n -match '\bft\b|finetuned|fine tuned') { $deploymentType = 'FineTuned' }
 
     # Host: Fireworks-hosted meters are prefixed FW and are a different SKU
     # from the Azure-direct model of the same name.
-    $host_ = if ($lower -contains 'fw') { 'Fireworks' } else { 'AzureDirect' }
+    $host_ = if ($n -match '^fw\b|\bfw\b') { 'Fireworks' } else { 'AzureDirect' }
+
+    # Purpose. Fine-tuning *grader* meters price evaluation runs, not inference.
+    # They sit alongside real inference meters for the same model and would
+    # otherwise be a candidate for an ordinary chat lookup.
+    $purpose = if ($n -match '\bgrdr\b|\bgrader\b') { 'Grader' } else { 'Inference' }
 
     # Modality - non-text meters must not be used for chat token maths.
+    # Audio meters carry a date suffix ('aud1217', 'aud 0828'), so a bare \baud\b
+    # misses them and they default to Text - an $11/1M audio meter then becomes a
+    # candidate for a text chat lookup.
     $modality = 'Text'
-    if     ($lower -contains 'img' -or $lower -contains 'image') { $modality = 'Image' }
-    elseif ($lower -contains 'aud' -or $lower -contains 'audio') { $modality = 'Audio' }
-    elseif ($lower -contains 'rt')                               { $modality = 'Realtime' }
+    if     ($n -match '\bimg\b|\bimage\b')  { $modality = 'Image' }
+    elseif ($n -match '\brt\b|realtime')    {
+        $modality = if ($n -match '\baud\d*\b|\baudio\b') { 'RealtimeAudio' } else { 'Realtime' }
+    }
+    elseif ($n -match '\baud\d*\b|\baudio\b|\btts\b|trscb|tcrb|transcribe') { $modality = 'Audio' }
 
     # Normalise price to USD per 1M tokens, honouring unitOfMeasure per row.
     # Token meters are '1K' or '1M'; PTU is '1/Hour'; reservations are '1/Month'.
@@ -150,6 +185,7 @@ function ConvertTo-MeterAttributes {
         DeploymentType = $deploymentType
         Host           = $host_
         Modality       = $modality
+        Purpose        = $purpose
         PricePer1M     = if ($null -ne $per1M) { [math]::Round($per1M, 8) } else { $null }
         IsTokenMeter   = ($null -ne $per1M)
     }
@@ -232,6 +268,7 @@ function Build-FoundryPriceTable {
             DeploymentType = $attr.DeploymentType
             Host           = $attr.Host
             Modality       = $attr.Modality
+            Purpose        = $attr.Purpose
             UnitOfMeasure  = $item.unitOfMeasure
             RetailPrice    = $item.retailPrice
             PricePer1M     = $attr.PricePer1M
@@ -289,9 +326,11 @@ function Get-TokenPrice {
         [Parameter(Mandatory)][string] $ModelName,
         [string] $Publisher,
         [string] $Sku = 'GlobalStandard',
-        [Parameter(Mandatory)][ValidateSet('Input','Output','CachedInput')][string] $Kind,
+        [string] $ModelVersion,
+        [Parameter(Mandatory)][ValidateSet('Input','Output','CachedInput','CacheWrite')][string] $Kind,
         [ValidateSet('Standard','Long','Short')][string] $ContextTier = 'Standard',
-        [ValidateSet('Text','Image','Audio','Realtime')][string] $Modality = 'Text'
+        [ValidateSet('Text','Image','Audio','Realtime','RealtimeAudio')][string] $Modality = 'Text',
+        [ValidateSet('Inference','Grader')][string] $Purpose = 'Inference'
     )
 
     function New-Result($status, $price, $meter, $note) {
@@ -318,10 +357,19 @@ function Get-TokenPrice {
         'Global'    { 'Global';   break }
         default     { 'Regional' }
     }
+    # Provisioned (PTU) is capacity billed per hour, not per token. There is no
+    # per-token retail meter to find, so searching for one and returning NoMeter
+    # would read as a coverage gap. Say what it actually is.
+    if ($Sku -match 'Provisioned|PTU') {
+        return New-Result 'BilledAsCapacity' $null $null `
+            "SKU '$Sku' is provisioned throughput: billed per PTU per hour ('1/Hour'), not per token. Token counts are still useful for utilisation, but cost comes from the PTU reservation - not from this table."
+    }
+
     $depType = switch -Regex ($Sku) {
-        'Batch'       { 'Batch';       break }
-        'Provisioned' { 'Provisioned'; break }
-        default       { 'Standard' }
+        'Batch'    { 'Batch';     break }
+        'Flex'     { 'Flex';      break }
+        'Priority' { 'Priority';  break }
+        default    { 'Standard' }
     }
 
     $candidates = $Table.Entries | Where-Object {
@@ -330,6 +378,7 @@ function Get-TokenPrice {
         $_.ContextTier    -eq $ContextTier -and
         $_.DeploymentType -eq $depType     -and
         $_.Modality       -eq $Modality    -and
+        $_.Purpose        -eq $Purpose     -and
         $_.Host           -eq 'AzureDirect'
     }
 
@@ -349,54 +398,157 @@ function Get-TokenPrice {
             "Publisher '$Publisher' is not in the family map. No verdict claimed - add it rather than assuming a price."
     }
 
-    $verMatch = [regex]::Match($ModelName, '(\d+(?:\.\d+)+|\d{2,})')
+    # Narrow to this model. meterName carries abbreviations, not model IDs, so
+    # match on the distinctive version token rather than the whole name.
+    #
+    # Substring matching is NOT safe here, in both directions:
+    #   '20' from gpt-oss-20b is a substring of 'gpt-oss-120B'   -> 4x   wrong
+    #   '4'  from gpt-4o      is a token of    'gpt-4-turbo128K' -> 3.2x wrong
+    #   '1'  from DeepSeek-R1 sits inside      'V3.1 Inp glbl'   -> 9%   wrong
+    #
+    # So the token keeps BOTH a glued letter prefix and any trailing letters -
+    # 'R1', 'V3.2', 'K2', 'o3', '4o', '20b' - because for these publishers the
+    # letter is part of the version spelling, not a separate word. The match is
+    # then anchored on both sides against digits, letters AND '.', so a token
+    # can never match a fragment of a longer version.
+    $verMatch = [regex]::Match($ModelName, '(?<![A-Za-z])([A-Za-z]?\d+(?:\.\d+)*[A-Za-z]*)')
     if ($verMatch.Success) {
         $tok = $verMatch.Value
-        $narrowed = $candidates | Where-Object { $_.MeterName -like "*$tok*" }
-        if ($narrowed) { $candidates = $narrowed }
+        $mkAnchor = { param($s) '(?<![0-9A-Za-z.])' + [regex]::Escape($s) + '(?![0-9A-Za-z.])' }
+        $anchored = & $mkAnchor $tok
+
+        # Flex-tier meters drop the dot from the version ('54 inp Flex Gl' for
+        # gpt-5.4), so a dotted token can never reach them. Try the dot-stripped
+        # form as a fallback - still anchored, so it cannot match a fragment.
+        $alt = if ($tok -match '\.') { & $mkAnchor ($tok -replace '\.', '') } else { $null }
+
+        $narrowed = @($candidates | Where-Object {
+            $mn = ($_.MeterName -replace '[\-_]', ' ')
+            ($mn -match $anchored) -or ($alt -and $mn -match $alt)
+        })
+        if ($narrowed) { $candidates = @($narrowed) }
         else {
+            # Distinguish a genuine coverage gap from a query mismatch. If the
+            # model has meters at a DIFFERENT context tier or deployment type,
+            # say so - the newest models (5.5, 5.6, 6.x) have no Standard-tier
+            # meter at all and are priced only in Short/Long context bands.
+            $elsewhere = @($Table.Entries | Where-Object {
+                $_.Kind -eq $Kind -and $_.Host -eq 'AzureDirect' -and
+                $(($_.MeterName -replace '[\-_]',' ') -match $anchored)
+            })
+            if ($elsewhere.Count -gt 0) {
+                $tiers = ($elsewhere.ContextTier    | Sort-Object -Unique) -join '/'
+                $types = ($elsewhere.DeploymentType | Sort-Object -Unique) -join '/'
+                $scopes= ($elsewhere.Scope          | Sort-Object -Unique) -join '/'
+                return New-Result 'NoMeter' $null $null `
+                    "No meter for model=$ModelName at scope=$scope tier=$ContextTier type=$depType kind=$Kind, but $($elsewhere.Count) meters DO exist for it at scope=$scopes tier=$tiers type=$types. This is most likely a query mismatch rather than a coverage gap - the newest models have no Standard context tier and must be priced as Short or Long. Do NOT bill this as zero."
+            }
             return New-Result 'NoMeter' $null $null `
                 "No meter matches version token '$tok' for this model in scope=$scope kind=$Kind. This is a real coverage gap - models can be deployable and GA with no published price. Do NOT bill this as zero."
         }
-
-        # Variant disambiguation.
-        # The version token alone is not enough: 'gpt-5.4' matches the meters for
-        # 5.4, 5.4 pro, 5.4 mini and 5.4 nano, whose prices differ by an order of
-        # magnitude. Require the variant suffix to match on BOTH sides - the base
-        # model must not silently pick up a 'pro' meter.
-        $variants = @('pro','mini','nano','codex','flash','lite','turbo','sol','luna','terra','astra','chat','opt')
-        $modelLower = $ModelName.ToLowerInvariant()
-        $modelVariant = $null
-        foreach ($v in $variants) {
-            # Match as a discrete token, so 'flash' in 'V4-Flash' counts but a
-            # chance substring does not.
-            if ($modelLower -match "[\s\-_]$v(\b|[\s\-_]|$)") { $modelVariant = $v; break }
-        }
-
-        $exact = $candidates | Where-Object {
-            $mn = $_.MeterName.ToLowerInvariant()
-            $meterVariant = $null
-            foreach ($v in $variants) {
-                if ($mn -match "(^|[\s\-])$v([\s\-]|$)") { $meterVariant = $v; break }
-            }
-            $meterVariant -eq $modelVariant
-        }
-        if ($exact) { $candidates = $exact }
     }
-
-    $candidates = @($candidates)
-    if ($candidates.Count -eq 0) {
+    else {
+        # No version token at all ('whisper', 'gpt-realtime', 'model-router').
+        # There is nothing left to discriminate on: the variant filter alone
+        # would happily match any no-variant meter, which is how these models
+        # ended up priced from '5.5 ShortCo inp Gl' at $5.00. Refuse instead.
         return New-Result 'NoMeter' $null $null `
-            "No candidate meter for model=$ModelName scope=$scope kind=$Kind. Do NOT bill this as zero."
+            "Model '$ModelName' carries no version token, so it cannot be matched against abbreviated meter names without guessing. Meters for such models must be mapped explicitly. Do NOT bill this as zero."
     }
+
+    # Variant disambiguation. The version token alone is not enough: 'gpt-5.4'
+    # matches the meters for 5.4, 5.4 pro, 5.4 mini and 5.4 nano, whose prices
+    # differ by an order of magnitude. Require the variant to match on BOTH
+    # sides - the base model must not silently pick up a 'pro' meter.
+    #
+    # 'opt' must NOT appear here: it is the OUTPUT marker, not a variant.
+    # Listing it gave every output meter a phantom variant that could never
+    # match a model name, so $exact was always empty and disambiguation
+    # silently disabled itself for every output lookup - reopening the trap.
+    # Values are regex alternations because meters abbreviate ('mini' -> 'mn').
+    $variantAliases = [ordered]@{
+        'pro'   = 'pro';   'mini' = 'mini|mn'; 'nano'  = 'nano'
+        'codex' = 'codex'; 'flash'= 'flash';   'lite'  = 'lite'
+        'turbo' = 'turbo'; 'sol'  = 'sol';     'luna'  = 'luna'
+        'terra' = 'terra'; 'astra'= 'astra';   'chat'  = 'chat'
+        'reasoning' = 'reasoning'; 'mm' = 'mm|multimodal'
+        'research'  = 'research|deep research'
+        'medium' = 'medium'; 'large' = 'large'; 'small' = 'small'
+    }
+
+    # Collect ALL variant markers on each side and compare as sets. Stopping at
+    # the first hit loses information when a name carries two markers:
+    # 'Phi-4-Mini MM-Input' is both 'mini' AND 'mm', and reducing it to 'mini'
+    # alone made it mismatch 'Phi-4-multimodal-instruct' - so the correct $0.08
+    # meter was discarded in favour of the plain Phi-4 meter at $0.125.
+    function Get-VariantSet([string] $Text, $Aliases) {
+        $t = $Text.ToLowerInvariant() -replace '[\-_]', ' '
+        $found = [System.Collections.Generic.SortedSet[string]]::new()
+        foreach ($v in $Aliases.Keys) {
+            if ($t -match "(^|\s)($($Aliases[$v]))(\s|$)") { [void]$found.Add($v) }
+        }
+        ($found -join '+')
+    }
+
+    $modelVariant = Get-VariantSet $ModelName $variantAliases
+
+    $exact = @($candidates | Where-Object {
+        (Get-VariantSet $_.MeterName $variantAliases) -eq $modelVariant
+    })
+
+    # The filter is applied unconditionally. An earlier version did
+    # `if ($exact) { $candidates = $exact }`, which meant an EMPTY result
+    # silently bypassed the filter and left every variant meter in play - so a
+    # base model could be priced from a variant's meter:
+    #   gpt-5.3 -> '5.3 codex inp Gl'        (model has no variant, meter does)
+    #   gpt-4o-mini -> 'gpt-4-turbo128K Inp' (model has a variant, meter does not)
+    # An empty set means "no meter matches this model's variant", which is a
+    # NoMeter answer, not a licence to guess.
+    if ($exact.Count -eq 0) {
+        $offered = @($candidates | Select-Object -ExpandProperty MeterName -First 4) -join ' | '
+        $want = if ($modelVariant) { "variant '$modelVariant'" } else { 'the base model (no variant)' }
+        $vt   = if ($verMatch.Success) { "Version token '$($verMatch.Value)'" } else { 'The model name' }
+        return New-Result 'NoMeter' $null $null `
+            "$vt matched $($candidates.Count) meter(s) at scope=$scope tier=$ContextTier type=$depType, but none is for $want - closest were: $offered. Billing from a different variant can be an order of magnitude out, so no price is claimed. Do NOT bill this as zero."
+    }
+    $candidates = @($exact)
+
+    if ($candidates.Count -gt 1) {
+        # Dated meters: gpt-4o ships as 0513 / 0806 / 1120 and those prices
+        # differ 2x ($5.00 vs $2.50). The model NAME cannot tell them apart, so
+        # if the caller knows the deployed version, use it. Azure Monitor exposes
+        # this as the ModelVersion dimension and the ARM catalog as Version.
+        if ($ModelVersion) {
+            # Catalog version strings are not uniform: '2024-11-20',
+            # 'turbo-2024-04-09', '2024-08-06-preview', '001', 'latest'.
+            # Pull MMDD from anywhere in the string rather than anchoring, and
+            # say so when it cannot be used - the caller supplied disambiguating
+            # information and deserves to know it was ignored.
+            $mmdd = if ($ModelVersion -match '(\d{2})-(\d{2})(?!\d)') { "$($Matches[1])$($Matches[2])" }
+                    elseif ($ModelVersion -match '^\d{4}$')           { $ModelVersion }
+                    else { $null }
+            if ($mmdd) {
+                $dated = @($candidates | Where-Object {
+                    ($_.MeterName -replace '[\-_]',' ') -match "(?<![0-9])$mmdd(?![0-9])"
+                })
+                if ($dated.Count -gt 0) { $candidates = $dated }
+                else { Write-Verbose "ModelVersion '$ModelVersion' parsed to '$mmdd' but matched no meter; ignoring." }
+            }
+            else {
+                Write-Warning "ModelVersion '$ModelVersion' is not in a form this lookup can use (expects YYYY-MM-DD or MMDD). Ignoring it - the result may be Ambiguous."
+            }
+        }
+    }
+
     if ($candidates.Count -gt 1) {
         $distinct = @($candidates.PricePer1M | Sort-Object -Unique)
         if ($distinct.Count -eq 1) {
             return New-Result 'Priced' $distinct[0] $candidates[0].MeterName `
                 "$($candidates.Count) meters matched, all at the same price."
         }
+        $hint = if (-not $ModelVersion) { " If these are version-dated meters (e.g. 0513 / 0806 / 1120), pass -ModelVersion to pick one." } else { '' }
         return New-Result 'Ambiguous' $null ($candidates.MeterName -join ' | ') `
-            "$($candidates.Count) meters matched with $($distinct.Count) different prices: $($distinct -join ', '). Narrow by ContextTier or Modality rather than guessing."
+            "$($candidates.Count) meters matched with $($distinct.Count) different prices: $($distinct -join ', '). Narrow by ContextTier or Modality rather than guessing.$hint"
     }
 
     New-Result 'Priced' $candidates[0].PricePer1M $candidates[0].MeterName $null
@@ -448,6 +600,14 @@ function Measure-RequestCost {
         Measure-RequestCost -Table $t -ModelName 'gpt-oss-120b' `
             -Publisher 'OpenAI-OSS' -Sku GlobalStandard `
             -InputTokens 1500 -CachedTokens 1000 -OutputTokens 300
+
+    .EXAMPLE
+        # The newest models (5.5, 5.6, 6.x) have NO Standard-tier meter - they
+        # are priced only in Short/Long context bands, which differ by 2x. You
+        # must say which band the request fell into.
+        Measure-RequestCost -Table $t -ModelName 'gpt-6-astra' `
+            -Publisher 'OpenAI' -Sku GlobalStandard -ContextTier Short `
+            -InputTokens 1000 -OutputTokens 500
     #>
     [CmdletBinding()]
     param(
@@ -455,19 +615,46 @@ function Measure-RequestCost {
         [Parameter(Mandatory)][string] $ModelName,
         [string] $Publisher,
         [string] $Sku = 'GlobalStandard',
-        [int] $InputTokens  = 0,
-        [int] $CachedTokens = 0,
-        [int] $OutputTokens = 0
+        [string] $ModelVersion,
+        [ValidateSet('Standard','Long','Short')][string] $ContextTier = 'Standard',
+        [ValidateSet('Text','Image','Audio','Realtime','RealtimeAudio')][string] $Modality = 'Text',
+        [int] $InputTokens      = 0,
+        [int] $CachedTokens     = 0,
+        [int] $CacheWriteTokens = 0,
+        [int] $OutputTokens     = 0
     )
 
-    $inP  = Get-TokenPrice -Table $Table -ModelName $ModelName -Publisher $Publisher -Sku $Sku -Kind Input
-    $outP = Get-TokenPrice -Table $Table -ModelName $ModelName -Publisher $Publisher -Sku $Sku -Kind Output
+    $common = @{
+        Table = $Table; ModelName = $ModelName; Publisher = $Publisher
+        Sku = $Sku; ContextTier = $ContextTier; Modality = $Modality
+    }
+    if ($ModelVersion) { $common.ModelVersion = $ModelVersion }
+
+    $inP  = Get-TokenPrice @common -Kind Input
+    $outP = Get-TokenPrice @common -Kind Output
 
     # Cached input is optional: many models have no cached meter, in which case
     # cached tokens bill at the standard input rate.
     $cacP = $null
     if ($CachedTokens -gt 0) {
-        $cacP = Get-TokenPrice -Table $Table -ModelName $ModelName -Publisher $Publisher -Sku $Sku -Kind CachedInput
+        $cacP = Get-TokenPrice @common -Kind CachedInput
+    }
+
+    # Cache WRITE is a separate, far more expensive meter (verified 12.5x the
+    # cache-read rate). If the caller reports write tokens we must not bill them
+    # at the read rate, and we must not silently drop them either.
+    $cwP = $null
+    if ($CacheWriteTokens -gt 0) {
+        $cwP = Get-TokenPrice @common -Kind CacheWrite
+        if ($cwP.Status -ne 'Priced') {
+            return [pscustomobject]@{
+                ModelName   = $ModelName
+                CostUSD     = $null
+                Status      = "Unpriced: cacheWrite=$($cwP.Status)"
+                Note        = "CacheWriteTokens were supplied but no cache-write meter resolved. Billing them at the read rate would understate cost by roughly 12x, so no cost is claimed. $($cwP.Note)"
+                IsListPrice = $Table.IsListPrice
+            }
+        }
     }
 
     if ($inP.Status -ne 'Priced' -or $outP.Status -ne 'Priced') {
@@ -482,19 +669,25 @@ function Measure-RequestCost {
 
     # prompt_tokens already includes cached tokens, so bill the remainder at the
     # standard input rate and the cached portion at the cached rate.
+    # Integer division is not a risk here: PowerShell's / on int operands yields
+    # a double, so 1000/1000000 is 0.001 and not 0.
     $billableIn = [math]::Max(0, $InputTokens - $CachedTokens)
     $cachedRate = if ($cacP -and $cacP.Status -eq 'Priced') { $cacP.PricePer1M } else { $inP.PricePer1M }
+    $cwRate     = if ($cwP) { $cwP.PricePer1M } else { $null }
 
-    $cost = ($billableIn  / 1000000 * $inP.PricePer1M) +
+    $cost = ($billableIn   / 1000000 * $inP.PricePer1M) +
             ($CachedTokens / 1000000 * $cachedRate) +
             ($OutputTokens / 1000000 * $outP.PricePer1M)
+    if ($CacheWriteTokens -gt 0) { $cost += ($CacheWriteTokens / 1000000 * $cwRate) }
 
     [pscustomobject]@{
         ModelName    = $ModelName
         CostUSD      = [math]::Round($cost, 8)
         Status       = 'Priced'
+        ContextTier  = $ContextTier
         InputRate1M  = $inP.PricePer1M
         CachedRate1M = $cachedRate
+        CacheWriteRate1M = $cwRate
         OutputRate1M = $outP.PricePer1M
         CachedRateIsFallback = -not ($cacP -and $cacP.Status -eq 'Priced')
         IsListPrice  = $Table.IsListPrice

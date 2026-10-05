@@ -38,6 +38,7 @@ param(
     [string] $ResourceGroup,
     [Parameter(Mandatory)][string] $AccountName,
     [string] $Region       = "eastus2",
+    [string] $Deployment,
     [int]    $LookbackMins = 60,
     [switch] $IncludeCost
 )
@@ -121,8 +122,12 @@ function Invoke-MeteredCompletion {
         $payload.stream_options = @{ include_usage = $true }
     }
 
-    $tmp = Join-Path $env:TEMP ("req-" + [guid]::NewGuid().ToString('N') + ".json")
-    ($payload | ConvertTo-Json -Depth 8 -Compress) | Set-Content $tmp -Encoding ascii
+    # GetTempPath() rather than $env:TEMP: TEMP is unset on Linux/macOS pwsh, so
+    # Join-Path would throw on a null path before any call was issued.
+    # utf8NoBOM rather than ascii: ascii replaces every non-ASCII codepoint with
+    # '?', silently mangling any non-English prompt before it reaches the model.
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("req-" + [guid]::NewGuid().ToString('N') + ".json")
+    ($payload | ConvertTo-Json -Depth 8 -Compress) | Set-Content $tmp -Encoding utf8NoBOM
 
     $sw  = [System.Diagnostics.Stopwatch]::StartNew()
     $raw = curl.exe -s -N -X POST "$Endpoint/openai/v1/chat/completions" `
@@ -191,21 +196,49 @@ function Get-FoundryModelCatalog {
 
     $resp = Invoke-ArmWithRetry -Uri $uri -Token $Token
 
-    # The API returns one entry per SKU, so collapse to one row per model.
-    $seen = @{}
+    # The API returns one entry per SKU AND per version, so collapse to one row
+    # per model name while UNIONING the SKUs. Keying on name alone and taking
+    # the first entry wholesale would under-report which SKUs a model supports.
+    $byName = [ordered]@{}
     foreach ($item in $resp.value) {
         $m = $item.model
-        if ($seen.ContainsKey($m.name)) { continue }
-        $seen[$m.name] = $true
+        if (-not $byName.Contains($m.name)) {
+            $byName[$m.name] = [pscustomobject]@{
+                Name       = $m.name
+                Version    = $m.version
+                Format     = $m.format
+                # GOTCHA: the ARM catalog's 'publisher' field is EMPTY on every
+                # entry (verified: 328/328 null in eastus2). The publisher key
+                # actually lives in 'format' - and its values ('OpenAI',
+                # 'OpenAI-OSS', 'DeepSeek', 'Mistral AI', ...) are exactly what
+                # Get-TokenPrice -Publisher expects. Reading 'publisher'
+                # directly yields a silent null, not an error.
+                Publisher  = if ($m.publisher) { $m.publisher } else { $m.format }
+                Lifecycle  = $m.lifecycleStatus
+                Skus       = [System.Collections.Generic.HashSet[string]]::new()
+                Versions   = [System.Collections.Generic.HashSet[string]]::new()
+                # usageName is the join key to quota; useful for capacity
+                # dashboards. Guarded: $null[0] throws, and with
+                # $ErrorActionPreference='Stop' one entry lacking a skus array
+                # would abort the whole catalog call.
+                UsageName  = if ($m.skus -and $m.skus.Count -gt 0) { $m.skus[0].usageName } else { $null }
+            }
+        }
+        $row = $byName[$m.name]
+        if ($m.version) { [void]$row.Versions.Add($m.version) }
+        foreach ($s in $m.skus) { if ($s.name) { [void]$row.Skus.Add($s.name) } }
+    }
+
+    foreach ($row in $byName.Values) {
         [pscustomobject]@{
-            Name       = $m.name
-            Version    = $m.version
-            Format     = $m.format
-            Publisher  = $m.publisher
-            Lifecycle  = $m.lifecycleStatus
-            Skus       = ($m.skus | ForEach-Object { $_.name }) -join ','
-            # usageName is the join key to quota; useful for capacity dashboards
-            UsageName  = $m.skus[0].usageName
+            Name       = $row.Name
+            Version    = $row.Version
+            Versions   = (($row.Versions | Sort-Object) -join ',')
+            Format     = $row.Format
+            Publisher  = $row.Publisher
+            Lifecycle  = $row.Lifecycle
+            Skus       = (($row.Skus | Sort-Object) -join ',')
+            UsageName  = $row.UsageName
         }
     }
 }
@@ -415,20 +448,36 @@ if (-not $ResourceGroup)  {
 
 $token = Get-ArmToken
 
-Write-Host "`n=== 0. INLINE METERING (zero lag - primary source for a gateway) ===" -ForegroundColor Green
-$inlinePrices = @{
-    'gpt-4.1' = @{ InputPer1M = 2.00; CachedInputPer1M = 0.50; OutputPer1M = 8.00 }
+# Resolve a deployment to exercise rather than assuming one exists. A hardcoded
+# name is the most likely first-run failure on someone else's subscription.
+if (-not $Deployment) {
+    $Deployment = az cognitiveservices account deployment list `
+        -n $AccountName -g $ResourceGroup --query "[0].name" -o tsv 2>$null
 }
-$endpoint = "https://$AccountName.openai.azure.com"
-$msgs = @(@{ role = "user"; content = "Reply with exactly: ok" })
 
-$nonStream = Invoke-MeteredCompletion -Endpoint $endpoint -Deployment 'gpt-4.1' `
-                -Messages $msgs -PriceTable $inlinePrices -MaxTokens 16 -TenantTag 'tenant-A'
-$streamed  = Invoke-MeteredCompletion -Endpoint $endpoint -Deployment 'gpt-4.1' `
-                -Messages $msgs -PriceTable $inlinePrices -MaxTokens 16 -TenantTag 'tenant-B' -Stream
+Write-Host "`n=== 0. INLINE METERING (zero lag - primary source for a gateway) ===" -ForegroundColor Green
+if (-not $Deployment) {
+    Write-Warning "No model deployment found on '$AccountName'. Skipping inline metering. Pass -Deployment <name> to target one explicitly."
+}
+else {
+    Write-Host "Using deployment '$Deployment'"
 
-@($nonStream, $streamed) | Where-Object { $_ } |
-    Format-Table Tenant, Streamed, InputTokens, CachedTokens, OutputTokens, CostUSD, TtftMs, TtltMs -AutoSize
+    # Illustrative rates so this section runs standalone. Build the real table
+    # with Build-FoundryPriceTable.ps1 - do not hardcode prices in production.
+    $inlinePrices = @{
+        $Deployment = @{ InputPer1M = 2.00; CachedInputPer1M = 0.50; OutputPer1M = 8.00 }
+    }
+    $endpoint = "https://$AccountName.openai.azure.com"
+    $msgs = @(@{ role = "user"; content = "Reply with exactly: ok" })
+
+    $nonStream = Invoke-MeteredCompletion -Endpoint $endpoint -Deployment $Deployment `
+                    -Messages $msgs -PriceTable $inlinePrices -MaxTokens 16 -TenantTag 'tenant-A'
+    $streamed  = Invoke-MeteredCompletion -Endpoint $endpoint -Deployment $Deployment `
+                    -Messages $msgs -PriceTable $inlinePrices -MaxTokens 16 -TenantTag 'tenant-B' -Stream
+
+    @($nonStream, $streamed) | Where-Object { $_ } |
+        Format-Table Tenant, Streamed, InputTokens, CachedTokens, OutputTokens, CostUSD, TtftMs, TtltMs -AutoSize
+}
 
 Write-Host "=== 1. MODEL CATALOG (real time) ===" -ForegroundColor Cyan
 $catalog = Get-FoundryModelCatalog -SubscriptionId $SubscriptionId -Region $Region -Token $token
@@ -455,9 +504,52 @@ $usage | Group-Object Deployment |
     Sort-Object TotalTokens -Descending | Select-Object -First 8 | Format-Table -AutoSize
 
 Write-Host "=== 4. NEAR-REAL-TIME COST (tokens x cached price) ===" -ForegroundColor Cyan
-# Minimal price table. In production, build this nightly from the Retail Prices API.
-$priceTable = @{
-    'gpt-4.1' = @{ InputPer1M = 2.00; OutputPer1M = 8.00 }
+# Derive rates from the real price table rather than hardcoding them. Hardcoded
+# rates in a cost path are the thing this repo exists to argue against, so the
+# demo should not do it either.
+$builder = Join-Path $PSScriptRoot 'Build-FoundryPriceTable.ps1'
+$priceTable = @{}
+if (Test-Path $builder) {
+    . $builder
+    $pt = Build-FoundryPriceTable -Region $Region
+    # Resolve the real publisher per model. Hardcoding 'OpenAI' made Claude
+    # traffic come back Ambiguous instead of BilledOutsideRetailAPI, which hides
+    # the fact that Anthropic bills through Marketplace and is not in this table.
+    $pubOf = @{}
+    $verOf = @{}
+    foreach ($c in $catalog) {
+        if ($c.Name -and -not $pubOf.ContainsKey($c.Name)) {
+            $pubOf[$c.Name] = $c.Publisher
+            $verOf[$c.Name] = $c.Version
+        }
+    }
+
+    foreach ($m in ($usage | Select-Object -ExpandProperty Model -Unique | Where-Object { $_ })) {
+        $pub = $pubOf[$m]
+        if (-not $pub) { Write-Warning "Model '$m' not in the $Region catalog; cannot resolve publisher. Skipping."; continue }
+        $lookup = @{ Table = $pt; ModelName = $m; Publisher = $pub; Sku = 'GlobalStandard' }
+        if ($verOf[$m]) { $lookup.ModelVersion = $verOf[$m] }
+        $in  = Get-TokenPrice @lookup -Kind Input
+        $out = Get-TokenPrice @lookup -Kind Output
+        # The newest models have no Standard context tier. Retry in the Short
+        # band rather than reporting a false coverage gap.
+        if ($in.Status -eq 'NoMeter' -or $out.Status -eq 'NoMeter') {
+            $inS  = Get-TokenPrice @lookup -Kind Input  -ContextTier Short
+            $outS = Get-TokenPrice @lookup -Kind Output -ContextTier Short
+            if ($inS.Status -eq 'Priced' -and $outS.Status -eq 'Priced') { $in = $inS; $out = $outS }
+        }
+        if ($in.Status -eq 'Priced' -and $out.Status -eq 'Priced') {
+            $priceTable[$m] = @{ InputPer1M = $in.PricePer1M; OutputPer1M = $out.PricePer1M }
+        }
+        else {
+            # Deliberately leave the model out. A missing entry yields a null
+            # cost downstream; inventing a rate would yield a confident wrong one.
+            Write-Warning "No usable price for '$m' [$pub] (in=$($in.Status), out=$($out.Status)). Cost will be null, not zero."
+        }
+    }
+}
+else {
+    Write-Warning "Build-FoundryPriceTable.ps1 not found alongside this script. Skipping cost estimation rather than hardcoding rates."
 }
 Get-NearRealTimeCost -Usage $usage -PriceTable $priceTable |
     Sort-Object InputTokens -Descending | Select-Object -First 8 | Format-Table -AutoSize

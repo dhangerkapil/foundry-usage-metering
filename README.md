@@ -84,7 +84,31 @@ $p = Get-TokenPrice -Table $prices -ModelName 'gpt-oss-120b' `
 Measure-RequestCost -Table $prices -ModelName 'gpt-oss-120b' -Publisher 'OpenAI-OSS' `
     -Sku GlobalStandard -InputTokens 10000 -CachedTokens 4000 -OutputTokens 2000
 #   CostUSD = 0.0027
+
+# Models that are priced only in context bands need the band
+Measure-RequestCost -Table $prices -ModelName 'gpt-6-astra' -Publisher 'OpenAI' `
+    -Sku GlobalStandard -ContextTier Short `
+    -InputTokens 10000 -CachedTokens 4000 -CacheWriteTokens 2000 -OutputTokens 1000
+#   CostUSD = 0.139
+
+# Models that ship several dated versions need the version
+Get-TokenPrice -Table $prices -ModelName 'gpt-4o' -Publisher 'OpenAI' `
+    -Sku GlobalStandard -Kind Input -ModelVersion '2024-11-20'
+#   Status = Priced, PricePer1M = 2.50   (2024-05-13 would be 5.00)
 ```
+
+### Resolving the publisher
+
+`Get-TokenPrice -Publisher` expects values like `OpenAI`, `OpenAI-OSS`, `DeepSeek`, `Mistral AI`.
+Those come from the ARM model catalog — but **not** from the field you would expect:
+
+```
+model.publisher  ->  empty on all 328 catalog entries in eastus2
+model.format     ->  'OpenAI', 'OpenAI-OSS', 'DeepSeek', 'Anthropic', ...
+```
+
+Reading `publisher` returns a silent null, so every lookup fails as `UnknownPublisher` and the
+whole catalog looks unpriceable. `Get-FoundryModelCatalog` coalesces `publisher` ← `format`.
 
 ### One model has many prices
 
@@ -103,8 +127,19 @@ FW GPT OSS 120B Cache Inp DZ    0.082 /1M    cached input
 A cache keyed on model name alone is ambiguous. Pick Data Zone when the deployment is actually
 Global and **every cost figure is 10% high** — not obviously broken, just steadily wrong.
 
-So the key is **model + scope + token kind + context tier + deployment type**, and the gateway
-must pass the deployment's actual SKU.
+So the key is **model + scope + token kind + context tier + deployment type + host + purpose**,
+and the gateway must pass the deployment's actual SKU.
+
+Three further splits are easy to miss, and each is a large error:
+
+| Split | Example | Delta |
+|---|---|---|
+| Cache **read** vs cache **write** | `gpt-5.6-sol` Long: `Cd Inp` 1.60 vs `Cd Wr` 20.00 | **12.5×** |
+| Service tier `Std` / `Flex` / `PP` | `gpt-5.6-sol` Short input: Std 4.00 vs PP 8.00 | **2×** |
+| Context band on newer models | `gpt-6-astra` input: Short 10.00 vs Long 20.00 | **2×** |
+
+`PP` is **Priority Processing**, not Provisioned — PTU is capacity billed per hour and never
+appears as a per-token meter. `-Sku ProvisionedManaged` returns `BilledAsCapacity`.
 
 ### Variant disambiguation is not optional
 
@@ -119,8 +154,17 @@ The version token alone is not enough. `gpt-5.4` appears as a substring in the m
 | `gpt-5.4-nano` | `5.4 nano Inp Gl 1M Tokens` | 0.20 |
 
 A substring match would bill `gpt-5.4` at the `pro` rate — **12× over**. `Get-TokenPrice` requires
-the variant suffix to match on both sides, and returns `Ambiguous` rather than guessing when it
-cannot decide.
+the variant to match on both sides, and returns `NoMeter` rather than guessing when nothing
+matches the model's own variant (or `Ambiguous` when several meters match at different prices).
+
+Two subtleties that cost real money, both found by review rather than by testing:
+
+- **The filter must be unconditional.** An earlier version skipped it when it matched nothing,
+  which let a base model fall back onto a variant's meter — `gpt-5.3` was priced from
+  `5.3 codex`. An empty result means `NoMeter`, not permission to keep the unfiltered set.
+- **The version token must be anchored.** `20` is a substring of `120`, and `4` is a token of
+  `gpt-4-turbo128K`. Unanchored, `gpt-oss-20b` priced from the `120B` meter and `gpt-4o` priced
+  from `gpt-4-turbo128K` — 4× and 3.2× over, both reported as a confident `Priced`.
 
 ### Verified price relationships
 
@@ -141,10 +185,40 @@ is the single most expensive mistake available here — it bills nothing for rea
 | Status | Meaning | What to do |
 |---|---|---|
 | `Priced` | Usable rate found | Use it |
-| `NoMeter` | **Coverage gap.** Model is deployable with no published price | Alert. Do not bill as zero |
+| `NoMeter` | **No usable match.** Either a real coverage gap, or the model name cannot be mapped to an abbreviated meter without guessing | Alert. Do not bill as zero. The note names the near-miss meters so you can pin an explicit override |
 | `BilledOutsideRetailAPI` | Publisher bills via Marketplace (Anthropic) | Correct, not a gap. Source cost from Cost Management |
 | `UnknownPublisher` | Not in the family map | No verdict claimed. Add the mapping |
-| `Ambiguous` | Several meters, different prices | Narrow by context tier or modality |
+| `Ambiguous` | Several meters, different prices | Narrow by context tier, modality or `-ModelVersion` |
+| `BilledAsCapacity` | SKU is provisioned throughput (PTU) | Billed per PTU per hour, not per token. Token counts still useful for utilisation; cost comes from the reservation |
+
+### Refusing to answer is a feature
+
+Run against the full eastus2 catalog, this resolves **56 of 136** models to a price:
+
+```
+Priced                  56
+NoMeter                 57      <- refuses rather than guesses
+BilledOutsideRetailAPI  14      <- Anthropic, correctly out of scope
+Ambiguous                5
+UnknownPublisher         4      <- Black Forest Labs (image models, not token-billed)
+```
+
+A looser matcher reaches a far higher "coverage" number — earlier drafts of this code did, and
+every point of that extra coverage was wrong:
+
+| Model | Loose match resolved to | Error |
+|---|---|---|
+| `gpt-4o` | `gpt-4-turbo128K` | 3.2× over |
+| `gpt-oss-20b` | `gpt-oss-120B` | 4× over |
+| `DeepSeek-R1` | `V3.1` | 9% under |
+| `whisper`, `gpt-realtime`, `model-router` | `5.5 ShortCo` | unrelated model |
+| `mistral-medium-3-5` | `Mistral Large 3` | wrong product |
+| `Phi-4-multimodal` | `Phi-4` | 56% over |
+
+All of those returned `Status = Priced` with no warning. **A billing system that is wrong 20% of
+the time and never says so is worse than one that answers 40% of the time and flags the rest.**
+Where a model genuinely cannot be mapped, the `NoMeter` note lists the near-miss meters so you
+can add an explicit override rather than inherit a silent error.
 
 Verified live:
 
@@ -187,24 +261,44 @@ rather than an error.
 |---|---|---|---|
 | 1 | `serviceName` is `'Foundry Models'`, not `'Cognitive Services'` | HTTP 200, **zero rows** | Builder throws with a pointed message if zero rows come back |
 | 2 | `unitOfMeasure` mixed: `1K`, `1M`, `1/Hour`, `1/Month` | Blanket multiplier off by 1000× | Normalised per row; non-token meters excluded |
-| 3 | `meterName` uses abbreviations, not model IDs | `gpt-4.1` never matches `gpt 4.1 Inp glbl Tokens` | Vocabulary table maps the abbreviations |
+| 3 | `meterName` uses abbreviations, not model IDs | `gpt-4.1` never matches `gpt 4.1 Inp glbl Tokens` | Regex vocabulary maps the abbreviations |
 | 4 | **`opt` means output**, not "optional" | Output mis-keyed, under-bills 4–6× | Explicit in the kind vocabulary |
-| 5 | `productName` inconsistent — `Azure Deepseek Models` (lowercase s) | `contains(…,'DeepSeek')` returns nothing | Exact family strings in the map |
-| 6 | One model has many meters (scope × kind × tier × type × host) | Wrong-but-plausible price | Composite cache key |
-| 7 | Version token is a substring of variants | `gpt-5.4` billed at `pro` rate, 12× over | Variant must match on both sides |
-| 8 | Deployable GA models with no meter | Cost silently 0 | `NoMeter` + null, never 0 |
-| 9 | Anthropic has no family at all | "Free" Claude traffic | `BilledOutsideRetailAPI` status |
-| 10 | List prices only | Over-reports spend vs invoice | `IsListPrice` on table and every result |
-| 11 | Paginated via `NextPageLink` | Silent truncation | Full pagination |
-| 12 | API throttles | Partial table | Backoff; throws rather than returning partial |
-| 13 | `Format-Table` rounds to 2dp | Per-token prices render `0.00` | Normalise to per-1M before display |
-| 14 | Streaming omits `usage` without `include_usage` | Token counts lost on most chat traffic | Injected by `Invoke-MeteredCompletion` |
-| 15 | Streamed responses carry no `latency_checkpoint` in the usage chunk | Missing TTFT on streamed calls | Documented; measure at the proxy |
-| 16 | Cost Management `timePeriod` ignored unless `timeframe="Custom"` | HTTP 400 | Set correctly in `Get-BilledCost` |
-| 17 | Cost Management throttles hard (4× 429 observed) | Apparent failure | 6 attempts, ~40 s backoff |
-| 18 | Model catalog returns one entry per SKU | Inflated model counts | De-duplicated on name + version |
-| 19 | Catalog is per-region | Model present in one region, absent in another | Region is a required parameter |
-| 20 | Unsupported service tier succeeds silently at standard rate | Expected discount never applied | Compare `ServiceTierRequest` vs `ServiceTierResponse` |
+| 5 | Scope has **five** spellings: `DZ`, `DZn`, `DZone`, `DataZone`, `Data Zone` (two words) | Any missed form falls through to the Global default — a 10% under-bill (gpt-4.1 Global $2.00 vs Data Zone $2.20) | Regex covers all five |
+| 6 | Kind markers appear concatenated and hyphenated: `BatchOutp`, `txt-out-glbl`, `inpt`, bare `In` | 175 real meters dropped as unclassifiable | Pattern matching on the normalised name, not token equality |
+| 7 | **Cache *write* is a different meter from cache *read*** — `Cd Wr` vs `Cd Inp` | Verified 12.5× apart (gpt-5.6-sol long: write $20.00 vs read $1.60/1M). One `Cached` kind makes the key collide and the winner arbitrary | Separate `CacheWrite` kind, tested **before** `CachedInput` |
+| 8 | "Cached" has four spellings: `cach`, `cchd`, `cched`, `cd` | `cched` meters silently classified as plain Input | All four in the vocabulary |
+| 9 | Context tier also abbreviates to `LoCo` / `ShCo` | Long context is exactly 2× base, so a miss is a 50% under-bill | `loco`/`shco` added |
+| 10 | `PP` is **Priority Processing**, not Provisioned | Verified exactly 2× standard across all four kinds. PTU is capacity billed `1/Hour` and never appears as a per-token meter, so labelling `PP` "Provisioned" is simply wrong | Distinct `Priority` tier; `Provisioned`/`PTU` SKUs return `BilledAsCapacity` |
+| 11 | `Flex` / `Fl` is a third service tier | Collided with `Standard`, so a Flex meter could answer a Standard lookup | Distinct `Flex` tier |
+| 12 | Audio meters carry a date suffix: `aud1217`, `aud 0828` | A bare `\baud\b` misses them, so an $11/1M **audio** meter defaults to `Text` and becomes a candidate for a chat lookup | `aud\d*`; realtime-audio split from realtime-text |
+| 13 | Fine-tuning **grader** meters sit beside inference meters for the same model | A grader rate can answer an ordinary chat lookup | `Purpose` field; lookups default to `Inference` |
+| 14 | `productName` inconsistent — `Azure Deepseek Models` (lowercase s) | `contains(…,'DeepSeek')` returns nothing | Exact family strings in the map |
+| 15 | One model has many meters (scope × kind × tier × type × host × purpose) | Wrong-but-plausible price | Composite cache key |
+| 16 | Version token is a substring of variants | `gpt-5.4` billed at `pro` rate, 12× over | Variant must match on both sides |
+| 17 | Meters abbreviate variants too (`mini` → `mn`) | Variant match fails, lookup falls back to the base rate | Variant aliases are regex alternations |
+| 18 | Deployable GA models with no meter | Cost silently 0 | `NoMeter` + null, never 0 |
+| 19 | Anthropic has no family at all | "Free" Claude traffic | `BilledOutsideRetailAPI` status |
+| 20 | List prices only | Over-reports spend vs invoice | `IsListPrice` on table and every result |
+| 21 | Paginated via `NextPageLink` | Silent truncation | Full pagination |
+| 22 | API throttles | Partial table | Backoff; throws rather than returning partial |
+| 23 | `Format-Table` rounds to 2dp | Per-token prices render `0.00` | Normalise to per-1M before display |
+| 24 | Streaming omits `usage` without `include_usage` | Token counts lost on most chat traffic | Injected by `Invoke-MeteredCompletion` |
+| 25 | Streamed responses carry no `latency_checkpoint` in the usage chunk | Missing TTFT on streamed calls | Documented; measure at the proxy |
+| 26 | Cost Management `timePeriod` ignored unless `timeframe="Custom"` | HTTP 400 | Set correctly in `Get-BilledCost` |
+| 27 | Cost Management throttles hard (4× 429 observed) | Apparent failure | 6 attempts, ~40 s backoff |
+| 28 | Model catalog returns one entry per SKU and per version | Inflated model counts | De-duplicated on name; SKUs and versions unioned across entries |
+| 29 | Catalog is per-region | Model present in one region, absent in another | Region is a required parameter |
+| 30 | Unsupported service tier succeeds silently at standard rate | Expected discount never applied | Compare `ServiceTierRequest` vs `ServiceTierResponse` |
+| 31 | **The ARM catalog's `publisher` field is empty on every entry** — verified 328/328 null in eastus2. The publisher key lives in `format` | Reading `publisher` yields a silent null, so every price lookup fails with "unknown publisher" and looks like missing coverage | `Get-FoundryModelCatalog` coalesces `publisher` ← `format` |
+| 32 | A version token is a substring of a longer one: `20` ⊂ `120`, `4` ⊂ `gpt-4-turbo128K` | `gpt-oss-20b` priced from the `120B` meter (4× over); `gpt-4o` priced from `gpt-4-turbo128K` (3.2× over) | Token keeps trailing letters (`4o`, `20b`) and is anchored with `(?<![0-9A-Za-z]) … (?![0-9A-Za-z])` |
+| 33 | Dated model versions have different prices: `gpt-4o` ships as `0513` / `0806` / `1120` at **$5.00 vs $2.50** | The model name alone cannot choose; picking the first is a coin flip | `-ModelVersion` maps `2024-11-20` → `1120`; without it the result is `Ambiguous`, not a guess |
+| 34 | A variant filter that is skipped when it matches nothing is worse than no filter | `gpt-5.3` priced from `5.3 codex`; `gpt-4o-mini` from `gpt-4-turbo128K` | The filter is unconditional; an empty result is `NoMeter`, not a licence to keep the unfiltered set |
+| 35 | The newest models have **no Standard context tier** — 9 model families are priced only in Short/Long bands that differ 2× | A caller defaulting to `Standard` sees `NoMeter` and reads it as a coverage gap | `NoMeter` now names the tiers that *do* exist; `Measure-RequestCost` accepts `-ContextTier` |
+| 36 | The version token often carries a **letter prefix** — `R1`, `V3.2`, `K2`, `o3` | Stripping it leaves `1`, which then matches *inside* `V3.1`: `DeepSeek-R1` priced at 1.23 instead of 1.35, while its own `R1` meter was excluded | The token keeps the glued letter, and anchoring excludes `.` so it cannot match a version fragment |
+| 37 | **Flex meters drop the dot** from the version — `54 inp Flex Gl` for `gpt-5.4` | A dotted token can never reach them; all 42 Flex meters were unreachable | A dot-stripped form is tried as an anchored fallback |
+| 38 | Some models have **no digits at all** — `whisper`, `gpt-realtime`, `model-router`, `codex-mini` | Nothing is left to match on, so they silently resolved to an unrelated meter (`5.5 ShortCo inp Gl`, $5.00) | No version token ⇒ `NoMeter`. These must be mapped explicitly |
+| 39 | A name can carry **two** variant markers — `Phi-4-Mini MM` is both `mini` and `mm` | Stopping at the first marker discards the right meter: `Phi-4-multimodal` took the plain `Phi-4` rate, 56% over | Variant markers are collected as a set and compared as a set |
+| 40 | Catalog versions are not uniform — `2024-11-20`, `turbo-2024-04-09`, `001`, `latest` | An unparsed `-ModelVersion` was silently ignored while the error still said "pass `-ModelVersion`" | MMDD is extracted from anywhere in the string; unusable values warn |
 
 ## Quick start
 
@@ -420,21 +514,35 @@ The Retail Prices API is **anonymous** — no auth, no subscription context. Pri
 | Azure Monitor lag | ≈ 2 min 51 s, exact counts |
 | Cost Management | Succeeded on the 5th attempt after 4× HTTP 429 |
 | Reconciliation | Gateway 75 tokens vs Monitor 122 — delta correctly identified as out-of-band traffic |
-| Price table build | 1,410 token meters classified from 1,585 raw rows (eastus2) |
+| Price table build | 1,528 token meters classified from 1,585 raw rows (eastus2) |
 | Scope awareness | `gpt-oss-120b` Global 0.15/0.60 vs Data Zone 0.165/0.66 — both resolved correctly |
+| Scope spelling variants | `gpt-4.1` Global 2.00/8.00 vs Data Zone 2.20/8.80 — the two-word `Data Zone` form resolves correctly |
 | Variant disambiguation | `gpt-5.4` → 2.50, `-pro` → 30, `-mini` → 0.75, `-nano` → 0.20 |
+| Variant filter is unconditional | `gpt-5.3` → `NoMeter` rather than silently taking the `5.3 codex` rate |
+| Version-token anchoring | `gpt-oss-20b` → `NoMeter` (not the `120B` rate); `gpt-4o` → `Ambiguous` (not the `gpt-4-turbo128K` rate) |
+| Dated versions | `gpt-4o` `-ModelVersion 2024-05-13` → 5.00, `2024-08-06` → 2.50, `2024-11-20` → 2.50 |
+| Cache read vs write | `gpt-5.6-sol` Long: read 1.60 vs **write 20.00** — separate kinds, no key collision |
+| Service tiers | `PP` (Priority) resolved at exactly 2× Standard; `Flex` separated; `ProvisionedManaged` → `BilledAsCapacity` |
+| Banded-only models | `gpt-6-astra` has no Standard tier; Short → 10/50, Long → 20/75, both resolved |
+| Publisher resolution | ARM `publisher` empty 328/328; coalescing from `format` resolves all 136 models |
 | Batch discount | `GlobalBatch` resolved to exactly 50% of `GlobalStandard` |
-| Null safety | Anthropic → `BilledOutsideRetailAPI` / null; `Measure-RequestCost` → null, not 0 |
+| Null safety | Anthropic → `BilledOutsideRetailAPI` / null; unknown model → `NoMeter` / null; `Measure-RequestCost` → null, not 0 |
 | Coverage gap | `DeepSeek-V4.1-Flash` → `NoMeter`; sibling `V3.2` → Priced 0.58 |
 | Cost arithmetic | 10k in / 4k cached / 2k out on gpt-oss-120b = $0.0027, matches hand calculation |
+| Cost arithmetic, banded + cache write | `gpt-6-astra` Short, 10k in / 4k cached / 2k write / 1k out = $0.139, matches hand calculation |
+| End-to-end | Live run priced `gpt-6-astra` at $293.51 (28.6M in @ $10 + 146k out @ $50) while correctly returning null for Claude |
 | Cache hit | 62 ms vs a full paged fetch |
+| Fresh clone | Clones and runs in a clean `pwsh -NoProfile` session with no manual setup |
+| Regression suite | 18 meter-parsing cases plus live lookup checks across 6 model families, 3 scopes, 4 kinds and 5 service tiers — all pass |
+| Independent review | Full source reviewed twice by a separate agent against live data; 15 defects found and fixed before publication |
+| Full-catalog sweep | All 136 catalogued models priced in one pass: 56 `Priced`, 57 `NoMeter`, 14 `BilledOutsideRetailAPI`, 5 `Ambiguous`, 4 `UnknownPublisher` — and **zero** resolved to another model's meter |
 
 ## Source documentation
 
 - [Azure Retail Prices API](https://learn.microsoft.com/en-us/rest/api/cost-management/retail-prices/azure-retail-prices)
 - [Azure Monitor — Metrics: List](https://learn.microsoft.com/en-us/rest/api/monitor/metrics/list)
 - [Cost Management — Query: Usage](https://learn.microsoft.com/en-us/rest/api/cost-management/query/usage)
-- [Monitor Azure OpenAI](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/monitor-openai)
+- [Monitor Azure OpenAI](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/how-to/monitor-openai)
 - [Models — List (Foundry catalog)](https://learn.microsoft.com/en-us/rest/api/aiservices/accountmanagement/models/list)
 - [Deployment types](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/deployment-types)
 
