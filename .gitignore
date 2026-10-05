@@ -1,0 +1,10 @@
+# Local state / output
+*.json
+!**/package.json
+*.log
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
