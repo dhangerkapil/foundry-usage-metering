@@ -90,9 +90,15 @@ $script:ScopePatterns = [ordered]@{
 }
 
 # Publishers that do not bill through the Retail Prices API at all.
-# Anthropic / Claude is Marketplace / committed-consumption billed, so a missing
-# meter is CORRECT for these - not a coverage gap. A gateway that reads
-# "no meter" as "free" would bill nothing for Claude traffic.
+# Anthropic / Claude bills through Azure Marketplace in Claude Consumption Units
+# (CCU), so a missing meter is CORRECT for these - not a coverage gap. A gateway
+# that reads "no meter" as "free" would bill nothing for Claude traffic.
+#
+# CCU is a single Marketplace meter with NO per-model dimension, which means
+# per-Claude-model cost cannot be derived from Cost Management either. Token
+# counts remain exact and come from Azure Monitor or the inference response;
+# only the per-model DOLLAR figure is unavailable. See:
+#   https://learn.microsoft.com/azure/foundry/foundry-models/concepts/claude-models-billing
 $script:NonRetailPublishers = @('Anthropic')
 
 # model.format (publisher) -> Retail Prices productName prefixes
@@ -348,7 +354,7 @@ function Get-TokenPrice {
 
     if ($Publisher -and $Publisher -in $script:NonRetailPublishers) {
         return New-Result 'BilledOutsideRetailAPI' $null $null `
-            "$Publisher bills through Marketplace / committed consumption. No Retail Prices meter exists and that is correct. Source cost from Cost Management, not from this table."
+            "$Publisher bills through Azure Marketplace in Claude Consumption Units (CCU). No Retail Prices meter exists and that is correct. CCU is a single meter with no per-model dimension, so Cost Management cannot break cost down per model either - do not expect to reconcile this model's dollars. Token counts are still exact from Azure Monitor. Rates: https://aka.ms/ccu-pricing"
     }
 
     # Derive scope and deployment type from the deployment SKU.

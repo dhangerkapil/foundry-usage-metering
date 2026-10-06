@@ -1,68 +1,274 @@
 # Foundry Usage Metering
 
-Measure token usage and cost for Microsoft Foundry — in real time, from the right API.
+Measure token usage and cost for Microsoft Foundry — in real time, across **every model
+publisher**, from the right API.
 
 There are four Azure APIs that expose model pricing, usage and cost. They are not
-interchangeable: they differ by orders of magnitude in freshness, and the fastest one is not
-an API call at all. This repo shows which to use for what, with measured latency figures
+interchangeable: they differ by orders of magnitude in freshness, and only one of them reports
+every publisher the same way. This repo shows which to use for what, with measured figures
 rather than documentation claims.
 
 Written for teams building an **AI gateway** in front of Foundry who need to show their own
 users what they are consuming and what it costs.
 
+Verified live against one Foundry account running **four publishers side by side** — OpenAI,
+Anthropic, xAI and DeepSeek.
+
 ## The short version
 
-| Source | Auth | Measured lag | Use it for |
-|---|---|---|---|
-| `usage` block on the inference response | — (already in path) | **Zero** | What users see |
-| ARM model catalog | Entra | Real time | Model inventory and lifecycle |
-| Azure Retail Prices API | **None** | Real time (cache daily) | Unit prices |
-| Azure Monitor metrics | Entra | **~3 minutes** | Cross-check, bypass detection |
-| Cost Management Query | Entra | Hours, throttled | Nightly reconciliation only |
+| Source | Auth | Measured lag | Covers all publishers? | Use it for |
+|---|---|---|---|---|
+| **Azure Monitor metrics** | Entra | **113–119 s** | **Yes — identical schema** | **Totals, reconciliation, bypass detection** |
+| `usage` on the inference response | — (already in path) | Zero | No — provider-shaped | Per-tenant attribution only |
+| ARM model catalog | Entra | Real time | Yes | Model inventory and lifecycle |
+| Azure Retail Prices API | **None** | Real time (cache daily) | **No — Anthropic absent** | Unit prices |
+| Cost Management Query | Entra | Hours, throttled | Aggregate only for Marketplace | Nightly reconciliation |
+
+**Prefer Azure Monitor.** It is the only surface where `InputTokens` / `OutputTokens` /
+`TotalTokens` carry the same names and dimensions for every publisher. One query covers an
+account running OpenAI, Anthropic, xAI and DeepSeek at once.
+
+**But the schema being uniform does not make the semantics uniform** — see
+[Monitor inherits the reasoning-token quirk](#-monitor-inherits-the-reasoning-token-quirk-too).
+Bill `TotalTokens − InputTokens`, never `OutputTokens`.
+
+**And Monitor cannot replace inline metering.** Its dimensions are `ApiName`, `Region`,
+`ModelDeploymentName`, `ModelName`, `ModelVersion` — there is **no tenant dimension**. Monitor
+can tell you a deployment burned 40k tokens; it cannot tell you which of your tenants burned
+them. Per-tenant attribution only exists in the request path.
+
+So: **Monitor for truth, inline for attribution** — and the inline path has to be
+provider-aware, which is most of what this repo is about.
 
 **Do not poll Cost Management for near-real-time cost.** It lags by hours and throttles hard —
-four consecutive HTTP 429s before a single query succeeded during testing. Compute cost from
-token counts and a cached price table instead, and use Cost Management only to reconcile.
+four consecutive HTTP 429s before a single query succeeded during testing.
 
-## The thing most gateways get wrong
+## Inline metering is provider-shaped
 
-Your gateway already sits in the response path. Every Foundry inference response carries an
-exact `usage` block — there is nothing to poll:
+An OpenAI-shaped parser does not gracefully degrade on other publishers. It **hard-fails** on
+Anthropic and **silently under-bills** xAI. Every row below was verified live:
 
-```json
-"usage": {
-  "prompt_tokens": 12,
-  "completion_tokens": 1,
-  "total_tokens": 13,
-  "prompt_tokens_details": { "cached_tokens": 0 },
-  "latency_checkpoint": {
-    "engine_ttft_ms": 37, "engine_tbt_ms": 9, "engine_ttlt_ms": 48
-  }
-}
+| | OpenAI | Anthropic | xAI | DeepSeek |
+|---|---|---|---|---|
+| Endpoint | `/openai/v1/chat/completions` | **`/anthropic/v1/messages`** | `/openai/v1/…` | `/openai/v1/…` |
+| Extra header | — | **`anthropic-version`** (required) | — | — |
+| Input field | `prompt_tokens` | **`input_tokens`** | `prompt_tokens` | `prompt_tokens` |
+| Output field | `completion_tokens` | **`output_tokens`** | `completion_tokens` | `completion_tokens` |
+| `total_tokens` | yes | **absent** | yes (disagrees) | yes |
+| Input includes cache reads | **yes** → subtract | **no** → don't subtract | yes → subtract | n/a |
+| Cache-write counter | — | `cache_creation_input_tokens` | — | — |
+| Reasoning in `completion_tokens` | **yes** | n/a | **no** | n/a |
+| Streaming usage | needs `include_usage` | automatic; **rejects** `include_usage` | needs `include_usage` | needs `include_usage` |
+| `latency_checkpoint` | yes (non-streamed only) | no | no | no |
+
+`Get-ProviderProfile` encodes this table; `ConvertTo-NormalizedUsage` collapses all four into
+one schema.
+
+### ⚠️ Anthropic is a different API, not a dialect
+
+```
+POST /openai/v1/chat/completions   with claude-haiku-4-5
+  -> {"error":{"code":"api_not_supported","message":"Requested API is currently not supported"}}
+
+POST /anthropic/v1/messages        without anthropic-version
+  -> 400 "anthropic-version: header is required"
 ```
 
-Multiply by a cached unit price and you have per-request, per-tenant cost at zero lag. The
-`latency_checkpoint` block gives you TTFT and total latency for free.
+A gateway routing Claude to the OpenAI path doesn't under-report — it fails the request
+outright. Note also that `<account>.openai.azure.com` does **not** route `/anthropic`; use
+`<account>.services.ai.azure.com`, which serves both.
 
-### ⚠️ Streaming silently omits `usage`
+### ⚠️ xAI excludes reasoning tokens from `completion_tokens`
 
-Verified both ways:
+This is the most expensive defect in the set, because it is silent and the error grows with
+reasoning effort. Measured on the same prompt:
+
+| Model | `prompt` | `completion` | `reasoning` | `total` | `prompt + completion` |
+|---|---|---|---|---|---|
+| **grok-4.3** | 13 | 81 | 451 | **545** | 94 ❌ |
+| o4-mini | 15 | 174 | 128 | 189 | 189 ✅ |
+
+On xAI, `reasoning_tokens` are billed, **excluded** from `completion_tokens`, and **included**
+in `total_tokens`. A gateway billing `completion_tokens` charges for 81 output tokens instead
+of 532 — an **85% under-bill on a single request**.
+
+On OpenAI the same tokens are already inside `completion_tokens`, so adding them there would
+**double-count**. The two cannot share a code path:
+
+```powershell
+# xAI
+$out = $completion_tokens + $reasoning_tokens
+# OpenAI
+$out = $completion_tokens
+```
+
+### ⚠️ The cache asymmetry inverts the arithmetic
+
+```
+OpenAI     prompt_tokens INCLUDES cached   ->  billable = prompt_tokens - cached_tokens
+Anthropic  input_tokens  EXCLUDES cached   ->  billable = input_tokens   (no subtraction)
+```
+
+`cache_read_input_tokens` and `cache_creation_input_tokens` are **siblings** of
+`input_tokens` on Anthropic, not components of it. Subtracting there double-discounts;
+not subtracting on OpenAI over-bills. This is confirmed in the Foundry docs — only uncached
+input counts toward Claude's ITPM quota.
+
+### ⚠️ Streaming differs three ways
 
 | Request | `usage` returned? |
 |---|---|
-| `"stream": true` alone | **No** |
-| `"stream": true` + `"stream_options": { "include_usage": true }` | **Yes** (final SSE chunk) |
+| OpenAI/xAI `"stream": true` alone | **No** |
+| OpenAI/xAI + `stream_options.include_usage` | **Yes** (final chunk) |
+| Anthropic `"stream": true` alone | **Yes** (always) |
+| Anthropic + `stream_options` | **HTTP 400** — `"Extra inputs are not permitted"` |
 
-For a chat workload most traffic is streamed. A gateway that does not set this **loses token
-counts on the majority of requests and under-bills**, with no error surfacing anywhere.
+So the common advice "always inject `include_usage`" **breaks every streamed Claude request**.
+Inject it per provider.
 
-**Fix:** inject `stream_options.include_usage = true` into every upstream streaming call
-regardless of what the caller sent, then strip the final usage chunk before relaying if you
-don't want clients to see it. `Invoke-MeteredCompletion` in this repo does exactly that.
+Worse, Anthropic emits `usage` **twice**:
 
-One caveat: on streamed responses the `latency_checkpoint` block does **not** ride inside the
-final usage chunk. Token counts are there; latency is not. Measure TTFT at the proxy for
-streamed traffic.
+```
+event: message_start   usage: { input_tokens: 10, output_tokens: 1  }   <- PARTIAL
+event: message_delta   usage: { input_tokens: 10, output_tokens: 13 }   <- FINAL
+```
+
+A `[regex]::Match` that takes the **first** hit records 1 output token instead of 13. Take the
+**last** usage object on an Anthropic stream.
+
+### ⚠️ Every current OpenAI flagship rejects `max_tokens`
+
+| Parameter | Models |
+|---|---|
+| `max_tokens` | gpt-4.1, gpt-4o, model-router, grok-4.3, DeepSeek |
+| **`max_completion_tokens`** | o4-mini, gpt-5-mini, gpt-5.1, gpt-5.4, gpt-5.6-sol, gpt-6-sol |
+
+Sending the wrong one is HTTP 400, not a warning. A sample hardcoding `max_tokens` cannot call
+any current reasoning model. Model-name lists rot, so `Invoke-MeteredCompletion` detects the
+error and retries once with the other spelling.
+
+## Anthropic bills in CCU — per-model cost is not derivable
+
+Claude in Foundry bills through **Azure Marketplace in Claude Consumption Units (CCU)**:
+
+- Token usage → priced at Anthropic's per-model rates → discounts → converted to CCU
+- Azure Cost Management shows **one CCU line with no per-model dimension**
+- The CCU meter is MACC-eligible and metered hourly, invoiced monthly in arrears
+
+Three consequences for a metering system:
+
+1. **Anthropic has no Retail Prices meter.** Its absence is correct, not a coverage gap. A
+   gateway reading "no meter" as "free" bills nothing for Claude.
+2. **Derived cost (`billed ÷ tokens`) is impossible for Claude.** Not hard — impossible. The
+   billed figure has no model grain.
+3. **Token counts are still exact.** Azure Monitor and the `usage` block both report Claude
+   tokens precisely. Only the per-model *dollar* figure is unavailable.
+
+`Get-TokenPrice` returns `BilledOutsideRetailAPI` for Anthropic, and `Get-NearRealTimeCost`
+tags those rows `BillingModel = CCU` so a null cost is distinguishable from a real coverage
+gap (`NoMeter`). Those two must never be conflated — one is by design, the other is an alert.
+
+Rates: <https://aka.ms/ccu-pricing>
+
+## Measured latency
+
+Not estimates. Isolated probes, one per publisher, emit timestamp vs first visibility in Azure
+Monitor (15 s poll granularity):
+
+| Publisher | Deployment | Monitor lag |
+|---|---|---|
+| xAI | grok-4.3 | **115 s** |
+| Anthropic | claude-haiku-4-5 | **116 s** |
+| OpenAI | gpt-4.1-nano | **119 s** |
+| DeepSeek | DeepSeek-V4.1-Flash | **113 s** |
+
+**Lag is uniform across publishers — roughly two minutes.** Minimum grain is `PT1M`, and token
+counts are exact, not sampled.
+
+Other documented delays, for contrast:
+
+| Surface | Delay |
+|---|---|
+| Azure Monitor metrics | ~2 min (measured above) |
+| Diagnostic logs → Log Analytics | up to 15 min |
+| Cost Management | ~5 hours from billing event |
+| CCU metering | hourly meter, monthly invoice |
+
+### Transient empty responses
+
+In 60 rapid back-to-back streamed calls, **2 returned a completely empty body** — 2 bytes, no
+SSE frames, no error JSON — with `include_usage` correctly set. A separate non-streamed
+DeepSeek call did the same.
+
+Azure Monitor recorded **zero tokens** for that DeepSeek call, which confirms these are genuine
+failed requests rather than silently-billed-but-unreported traffic. The caller gets nothing
+either, so it surfaces as an error, not a silent leak.
+
+Still: **never record zero tokens from a missing usage block.** Treat it as unknown and let the
+Monitor reconciliation tier settle the window.
+
+## Why run Azure Monitor when inline metering is faster
+
+**Azure Monitor sees all traffic. Your gateway only sees what went through it.**
+
+Reconciliation over one window during testing:
+
+| Source | Input tokens |
+|---|---|
+| Gateway-side inline metering | 75 |
+| Azure Monitor | 122 |
+
+The difference was traffic generated outside the metering wrapper. In production that delta is
+**someone calling the Foundry endpoint directly, bypassing the gateway** — unmetered,
+unattributed usage.
+
+Gateway total should equal Monitor total. A persistent gap is a leak. Add the empty-response
+case above and the provider-parsing defects, and Monitor is the only number you can defend.
+
+Useful dimensions on `ModelRequests`: `StatusCode`, `StreamType`, `IsSpillover`,
+`ServiceTierRequest` and `ServiceTierResponse`. The last pair lets you confirm a request
+actually *got* the service tier it asked for — a request for an unsupported tier can succeed
+silently at the standard rate, so comparing these two is the only way to detect it.
+
+### What Monitor cannot do
+
+- **No tenant dimension.** Hence inline metering.
+- **`TokensCacheMatchRate` and `ProvisionedConsumedTokens` are PTU-only.** Claude runs Global
+  Standard / Data Zone Standard, so there is no cache hit-rate metric for it.
+- **No project-level cost attribution for Marketplace models.** Chargeback by project does not
+  cover Claude.
+
+### ⚠️ Monitor inherits the reasoning-token quirk too
+
+The uniform schema is not uniform semantics. Azure Monitor's `OutputTokens` carries the **same
+xAI exclusion as the inference API** — reasoning tokens are missing from `OutputTokens` but
+present in `TotalTokens`.
+
+Measured on `grok-4.3` from Monitor:
+
+```
+InputTokens  =  34
+OutputTokens =  99
+TotalTokens  = 998
+
+InputTokens + OutputTokens  =  133   ← what a naive dashboard shows
+TotalTokens − InputTokens   =  964   ← actual billable output
+```
+
+A **7× under-report of output** on a reasoning workload, straight from the "source of truth".
+
+**Use `TotalTokens − InputTokens` as billable output.** It is correct for every publisher
+measured, because it equals `OutputTokens` wherever the publisher is consistent and recovers
+the missing tokens wherever it is not:
+
+| Deployment | `In` | `Out` | `Total` | `Total − In` | Matches `Out`? |
+|---|---|---|---|---|---|
+| claude-opus-5-5 | 6,803 | 322,316 | 329,119 | 322,316 | ✅ |
+| gpt-4.1-mini | 1,639 | 739 | 2,378 | 739 | ✅ |
+| **grok-4.3** | 34 | 99 | 998 | **964** | ❌ — reasoning recovered |
+
+`Get-NearRealTimeCost` does this automatically and reports the raw metric alongside it as
+`ReportedOutput`, so the divergence stays visible rather than being silently papered over.
 
 ## Building the cached price table
 
@@ -299,21 +505,43 @@ rather than an error.
 | 38 | Some models have **no digits at all** — `whisper`, `gpt-realtime`, `model-router`, `codex-mini` | Nothing is left to match on, so they silently resolved to an unrelated meter (`5.5 ShortCo inp Gl`, $5.00) | No version token ⇒ `NoMeter`. These must be mapped explicitly |
 | 39 | A name can carry **two** variant markers — `Phi-4-Mini MM` is both `mini` and `mm` | Stopping at the first marker discards the right meter: `Phi-4-multimodal` took the plain `Phi-4` rate, 56% over | Variant markers are collected as a set and compared as a set |
 | 40 | Catalog versions are not uniform — `2024-11-20`, `turbo-2024-04-09`, `001`, `latest` | An unparsed `-ModelVersion` was silently ignored while the error still said "pass `-ModelVersion`" | MMDD is extracted from anywhere in the string; unusable values warn |
+| 41 | **Anthropic is a different API, not a dialect** — `/openai/v1/chat/completions` returns `api_not_supported` | Every Claude call fails outright; an OpenAI-only gateway cannot meter Claude at all | `Get-ProviderProfile` routes Anthropic to `/anthropic/v1/messages` |
+| 42 | `anthropic-version` header is mandatory | HTTP 400 on every Claude request | Sent automatically for the Anthropic profile |
+| 43 | `<account>.openai.azure.com` does not route `/anthropic` | 404 even with correct path and headers | Samples use `<account>.services.ai.azure.com`, which serves both |
+| 44 | Anthropic field names differ: `input_tokens` / `output_tokens` | An OpenAI parser reads `prompt_tokens` and records **0**, not an error — silent total loss of Claude billing | `ConvertTo-NormalizedUsage` branches per provider |
+| 45 | Anthropic reports **no `total_tokens`** | `[int]$null` → 0; totals silently collapse | Total is always recomputed, never read |
+| 46 | **Anthropic `input_tokens` EXCLUDES cache reads; OpenAI `prompt_tokens` INCLUDES them** | Subtracting cached tokens on Anthropic double-discounts input | Subtraction applied only when `InputIncludesCache` |
+| 47 | **xAI excludes `reasoning_tokens` from `completion_tokens` but includes them in `total_tokens`** | grok-4.3 measured 13 + 81 ≠ 545. Billing `completion_tokens` under-bills output by **85%** on one request | Reasoning added to output only when `OutputIncludesReasoning` is false |
+| 48 | Anthropic **rejects** `stream_options` with HTTP 400 | "Always inject include_usage" breaks every streamed Claude call | Injected only on the OpenAI-compatible path |
+| 49 | **Anthropic emits `usage` twice on a stream** — `message_start` is partial, `message_delta` is final | First-match regex recorded 1 output token instead of 13 | `UseLastUsageMatch` takes the final object |
+| 50 | **Every current OpenAI flagship rejects `max_tokens`** — o4-mini, gpt-5.x, gpt-6.x need `max_completion_tokens` | HTTP 400; a sample hardcoding `max_tokens` cannot call any reasoning model | Detected from the error and retried once |
+| 51 | DeepSeek omits `prompt_tokens_details` entirely | A cached-token lookup yields null, not 0 | `[int]$null` coalesces to 0, which is correct here |
+| 52 | Anthropic has no `latency_checkpoint` | TTFT silently null for Claude | `HasLatencyBlock` gates the fields; measure at the proxy |
+| 53 | Occasional **completely empty response body** (2 bytes, no SSE, no error) under rapid sequential load — 2 in 60 streamed calls | Looks identical to "no usage" | Monitor confirmed **zero tokens** for such a call, so it is a failed request, not a silent under-bill. Never record 0; reconcile the window |
+| 54 | **Azure Monitor's `OutputTokens` inherits the xAI reasoning exclusion** — `TotalTokens` includes reasoning, `OutputTokens` does not | grok-4.3 from Monitor: in 34, out 99, total 998. A dashboard summing in+out shows 133 against a real 964 — a **7× under-report** from the "source of truth" | `Get-NearRealTimeCost` bills `TotalTokens − InputTokens` and surfaces the raw metric as `ReportedOutput` |
 
 ## Quick start
 
 ```powershell
 az login
 
-# All five tiers against your own Foundry account
+# All tiers against your own Foundry account.
+# Exercises ONE deployment per publisher automatically.
 .\Get-FoundryUsageTelemetry.ps1 -AccountName my-foundry-account
 
 # Narrow the window, pick a region, include the throttled cost query
 .\Get-FoundryUsageTelemetry.ps1 -AccountName my-foundry-account `
     -Region eastus2 -LookbackMins 60 -IncludeCost
+
+# Target a single deployment
+.\Get-FoundryUsageTelemetry.ps1 -AccountName my-foundry-account -Deployment claude-sonnet-5
 ```
 
 `-ResourceGroup` and `-SubscriptionId` are resolved from your `az` context when omitted.
+
+With no `-Deployment`, the inline-metering section picks one deployment **per publisher** and
+calls each one streamed and non-streamed. A single-provider smoke test is exactly how the
+Anthropic and xAI defects survived the first pass.
 
 ## Parameters
 
@@ -324,20 +552,24 @@ az login
 | `-ResourceGroup` | Resolved from the account name when omitted |
 | `-Region` | Region for the catalog and pricing lookups. Default `eastus2` |
 | `-LookbackMins` | Window for the Azure Monitor query. Default `60` |
+| `-Deployment` | Meter one specific deployment instead of one per publisher |
 | `-IncludeCost` | Also run the Cost Management query. Off by default because it is slow and throttled |
 
 ## What's in here
 
-**`Get-FoundryUsageTelemetry.ps1`** — the five telemetry tiers:
+**`Get-FoundryUsageTelemetry.ps1`** — the telemetry tiers:
 
 | Function | Tier | Purpose |
 |---|---|---|
-| `Invoke-MeteredCompletion` | 0 | The metering wrapper — includes the `include_usage` injection |
+| `Get-ProviderProfile` | 0 | Maps a publisher to endpoint, headers, field names and cache/reasoning semantics |
+| `ConvertTo-NormalizedUsage` | 0 | Collapses every publisher's usage block into one schema; recomputes totals |
+| `Invoke-MeteredCompletion` | 0 | Provider-aware metering wrapper — routing, conditional `include_usage`, `max_completion_tokens` retry |
 | `Get-FoundryModelCatalog` | 1 | Model inventory, de-duplicated across SKUs |
 | `Get-AzureRetailPrices` | 2 | Raw price rows with per-row unit normalisation |
-| `Get-TokenUsage` | 3 | Token metrics split by deployment and model |
+| `Get-FoundryDeployments` | 2b | Deployment → publisher join, from `properties.model.format` |
+| `Get-TokenUsage` | **3** | **Azure Monitor token metrics — the preferred, cross-publisher source** |
 | `Get-BilledCost` | 4 | Cost Management with 429 backoff |
-| `Get-NearRealTimeCost` | — | The join: tokens × cached price |
+| `Get-NearRealTimeCost` | — | The join: tokens × cached price, tagged `Derived` / `CCU` / `NoMeter` |
 | `Invoke-ArmWithRetry` | — | Shared throttle-aware ARM caller |
 | `Get-ArmToken` | — | Entra token acquisition |
 
@@ -350,42 +582,6 @@ az login
 | `Measure-RequestCost` | Cost one request. Returns null cost — never 0 — when any price is unknown |
 | `Get-UnpricedModels` | List models that are deployable but have no usable price |
 | `ConvertTo-MeterAttributes` | Parse an abbreviated `meterName` into structured attributes |
-
-## Measured latency
-
-Not estimates. A 17-token inference call was timed end to end:
-
-| Event | Time (UTC) |
-|---|---|
-| Inference call | 18:07:32 |
-| First visible in Azure Monitor | 18:10:23 |
-| **End-to-end lag** | **≈ 2 min 51 s** |
-
-Minimum grain is `PT1M`, and **token counts are exact, not sampled** — the probe reported
-exactly 17.
-
-## Why use Azure Monitor when inline metering is faster
-
-**Azure Monitor sees all traffic. Your gateway only sees what went through it.**
-
-Reconciliation over one window during testing:
-
-| Source | Input tokens |
-|---|---|
-| Gateway-side inline metering | 75 |
-| Azure Monitor | 122 |
-
-The difference was traffic generated outside the metering wrapper. In production that delta is
-**someone calling the Foundry endpoint directly, bypassing the gateway** — unmetered,
-unattributed usage.
-
-Gateway total should equal Monitor total. A persistent gap is a leak. That is the argument for
-running tier 3 even though tier 0 is faster.
-
-Useful dimensions on `ModelRequests`: `StatusCode`, `StreamType`, `IsSpillover`,
-`ServiceTierRequest` and `ServiceTierResponse`. The last pair lets you confirm a request
-actually *got* the service tier it asked for — a request for an unsupported tier can succeed
-silently at the standard rate, so comparing these two is the only way to detect it.
 
 ## Azure Retail Prices API — four gotchas
 
@@ -440,8 +636,9 @@ Filter:  serviceName eq 'Foundry Models'
 **Some models are deployable, GA, consuming quota, and have no published price meter at all.**
 Handle a null price explicitly — do not treat it as zero.
 
-Note also that **Anthropic / Claude has no family in this API**. Claude bills through
-Marketplace / committed consumption, so its absence is correct rather than a coverage gap. A
+Note also that **Anthropic / Claude has no family in this API**. Claude bills through Azure
+Marketplace in Claude Consumption Units, so its absence is correct rather than a coverage gap —
+see [Anthropic bills in CCU](#anthropic-bills-in-ccu--per-model-cost-is-not-derivable). A
 gateway that reads "no meter" as "free" would get this badly wrong.
 
 The Retail Prices API is **anonymous** — no auth, no subscription context. Prices returned are
@@ -450,40 +647,80 @@ The Retail Prices API is **anonymous** — no auth, no subscription context. Pri
 ## Recommended architecture
 
 ```
-                 ┌──────────────────────────────────────────┐
-  user request   │              Your AI Gateway             │
-  ───────────────▶                                          │
-                 │  ① inject stream_options.include_usage   │
-                 │  ② forward to Foundry                    │
-                 │  ③ read usage{} off the response         │
-                 │  ④ cost = tokens × cached unit price     │
-                 │  ⑤ emit per-tenant metric  ── ZERO LAG ──┼──▶ user dashboard
-                 └───────────────┬──────────────────────────┘
+                 ┌──────────────────────────────────────────────┐
+  user request   │               Your AI Gateway                │
+  ───────────────▶                                              │
+                 │  ① resolve publisher from model.format       │
+                 │  ② pick endpoint:  /openai  or  /anthropic   │
+                 │  ③ inject include_usage ONLY if not Anthropic│
+                 │  ④ forward to Foundry                        │
+                 │  ⑤ parse usage per provider, then normalise  │
+                 │  ⑥ cost = tokens × cached unit price         │
+                 │     (null for Anthropic — CCU, no model rate)│
+                 │  ⑦ emit per-TENANT metric ─── ZERO LAG ──────┼──▶ user dashboard
+                 └───────────────┬──────────────────────────────┘
                                  │
-                                 ▼
-                         Microsoft Foundry
-                                 │
+                                ▼
+                        Microsoft Foundry
+                                │
        ┌─────────────────────────┼──────────────────────────┐
        ▼                         ▼                          ▼
-  Retail Prices           Azure Monitor              Cost Management
-  (cache daily,           (~3 min, 1-min grain)      (hours, throttled)
-   anonymous)                    │                          │
-       │                         ▼                          ▼
-       └──────────▶ unit price   reconcile: gateway    nightly: computed
-                    table        vs Monitor =          vs billed = drift
-                                 bypass detection      alarm
+  Retail Prices        ★ AZURE MONITOR ★            Cost Management
+  (cache daily,         PREFERRED SOURCE             (hours, throttled)
+   anonymous,           ~2 min, 1-min grain                 │
+   NO Anthropic)        ALL publishers, one schema          │
+       │                 NO tenant dimension                │
+       │                         │                          ▼
+       └──────────▶ unit price   │                   nightly: computed
+                    table        ▼                   vs billed = drift
+                                reconcile:          (Anthropic only
+                                gateway vs Monitor   reconciles at the
+                                = bypass detection   aggregate CCU meter)
 ```
+
+**Read it as two independent loops.** Monitor is the system of record for *how many tokens*;
+the gateway is the system of record for *whose tokens*. Neither replaces the other, and any
+persistent gap between them is a bypass or a parsing defect.
 
 ## Implementation checklist
 
-- [ ] Inject `stream_options.include_usage = true` into every upstream streaming request
-- [ ] Read `prompt_tokens`, `completion_tokens` and **`prompt_tokens_details.cached_tokens`**
-      separately — cached input bills at a lower rate
+**Provider handling — do this first**
+
+- [ ] Resolve the publisher from `properties.model.format` on the ARM deployment; never infer
+      it from the deployment name
+- [ ] Route Anthropic to `/anthropic/v1/messages` with an `anthropic-version` header
+- [ ] Use the `<account>.services.ai.azure.com` host — `.openai.azure.com` does not route
+      `/anthropic`
+- [ ] Parse `input_tokens`/`output_tokens` for Anthropic, `prompt_tokens`/`completion_tokens`
+      otherwise
+- [ ] **Do not subtract cached tokens on Anthropic** — `input_tokens` already excludes them
+- [ ] **Add `reasoning_tokens` to output on xAI**, and do *not* add them on OpenAI
+- [ ] Recompute `total_tokens` yourself; Anthropic has none and xAI's disagrees
+- [ ] Retry once with `max_completion_tokens` when a model rejects `max_tokens`
+
+**Streaming**
+
+- [ ] Inject `stream_options.include_usage` on the OpenAI-compatible path **only**
+- [ ] Never send `stream_options` to Anthropic — it is HTTP 400
+- [ ] Take the **last** `usage` object on an Anthropic stream, not the first
+- [ ] Measure TTFT at the proxy for Anthropic and for all streamed traffic
+
+**Pricing and cost**
+
 - [ ] Build the price table nightly using `serviceName eq 'Foundry Models'`
 - [ ] **Normalise price per row by `unitOfMeasure`** — never a blanket multiplier
 - [ ] Treat a missing meter as **null, not zero**; alert rather than silently billing nothing
-- [ ] Poll Azure Monitor every 1–5 minutes and alert when
-      `monitor_tokens − gateway_tokens` exceeds a threshold
+- [ ] Distinguish `CCU` (Anthropic, null by design) from `NoMeter` (a real gap worth alerting)
+- [ ] Do not attempt per-model cost reconciliation for Claude — the CCU meter has no model grain
+
+**Reconciliation**
+
+- [ ] Poll Azure Monitor every 1–5 minutes as the cross-publisher source of truth
+- [ ] **Bill `TotalTokens − InputTokens`, never `OutputTokens`** — Monitor carries the same xAI
+      reasoning exclusion as the inference API
+- [ ] Alert when `monitor_tokens − gateway_tokens` exceeds a threshold
+- [ ] Never record zero tokens from a missing usage block — mark the window unknown and let
+      Monitor settle it
 - [ ] Run Cost Management **once nightly**, with 429 backoff, and alert on drift
 - [ ] Capture `ServiceTierRequest` vs `ServiceTierResponse` to detect silent tier downgrades
 
@@ -506,12 +743,27 @@ The Retail Prices API is **anonymous** — no auth, no subscription context. Pri
 
 | Scenario | Result |
 |---|---|
-| Non-streaming call | `usage` present, cost computed, TTFT 37 ms / TTLT 48 ms |
-| Streaming without `include_usage` | **No usage block** |
-| Streaming with `include_usage` | Usage present in final chunk; no `latency_checkpoint` |
+| **Four publishers, one account** | OpenAI, Anthropic, xAI and DeepSeek all metered through one normalised schema |
+| **Anthropic on the OpenAI path** | `api_not_supported` — correctly surfaced as a failed call, not as "no usage" |
+| **Anthropic on `/anthropic/v1/messages`** | Usage present, streamed and non-streamed, output token counts identical (54 / 54) |
+| **Anthropic without `anthropic-version`** | HTTP 400 — header confirmed mandatory |
+| **Anthropic + `stream_options`** | HTTP 400 `"Extra inputs are not permitted"` — confirms it must not be injected |
+| **Anthropic streamed usage, first vs last** | `message_start` 1 token vs `message_delta` 13 — last-match selection verified |
+| **xAI reasoning tokens** | grok-4.3 output 327 captured (reasoning 326) where `completion_tokens` alone reports 1 |
+| **xAI total reconciliation** | computed `in + cache + out` equals reported `total_tokens` with reasoning added |
+| **OpenAI reasoning tokens** | o4-mini output 174 with reasoning 128 **not** double-counted; total matches exactly |
+| **`max_completion_tokens` retry** | o4-mini, gpt-6-sol succeed after automatic retry; gpt-4.1-mini unaffected |
+| **DeepSeek minimal usage block** | No `prompt_tokens_details`; cached coalesces to 0, totals correct |
+| Non-streaming call | `usage` present, cost computed, TTFT 26–168 ms depending on model |
+| Streaming without `include_usage` (OpenAI) | **No usage block** |
+| Streaming with `include_usage` (OpenAI) | Usage present in final chunk; no `latency_checkpoint` |
+| **Azure Monitor lag, per publisher** | xAI 115 s, Anthropic 116 s, OpenAI 119 s, DeepSeek 113 s — **uniform ≈ 2 min** |
+| **Monitor cross-publisher query** | One query returned all four publishers with identical schema and dimensions |
+| **Monitor reasoning-token quirk** | grok-4.3 from Monitor: in 34 / out 99 / total 998 — `total − in` = 964 recovers reasoning that `in + out` (133) loses |
+| **`Total − In` is universally correct** | Equals `OutputTokens` exactly for claude-opus-5-5 (322,316) and gpt-4.1-mini (739); recovers 964 for grok-4.3 |
+| **Empty-response transient** | 2 in 60 streamed calls returned a 2-byte body; Monitor confirmed **zero tokens**, so a failed request rather than a silent under-bill |
 | Model catalog, one region | 136 distinct models |
 | Retail Prices, one region | 1,585 token meters |
-| Azure Monitor lag | ≈ 2 min 51 s, exact counts |
 | Cost Management | Succeeded on the 5th attempt after 4× HTTP 429 |
 | Reconciliation | Gateway 75 tokens vs Monitor 122 — delta correctly identified as out-of-band traffic |
 | Price table build | 1,528 token meters classified from 1,585 raw rows (eastus2) |
@@ -527,6 +779,7 @@ The Retail Prices API is **anonymous** — no auth, no subscription context. Pri
 | Publisher resolution | ARM `publisher` empty 328/328; coalescing from `format` resolves all 136 models |
 | Batch discount | `GlobalBatch` resolved to exactly 50% of `GlobalStandard` |
 | Null safety | Anthropic → `BilledOutsideRetailAPI` / null; unknown model → `NoMeter` / null; `Measure-RequestCost` → null, not 0 |
+| **CCU vs NoMeter** | Claude rows tagged `BillingModel = CCU` (null by design); genuine gaps stay `NoMeter` (alertable) |
 | Coverage gap | `DeepSeek-V4.1-Flash` → `NoMeter`; sibling `V3.2` → Priced 0.58 |
 | Cost arithmetic | 10k in / 4k cached / 2k out on gpt-oss-120b = $0.0027, matches hand calculation |
 | Cost arithmetic, banded + cache write | `gpt-6-astra` Short, 10k in / 4k cached / 2k write / 1k out = $0.139, matches hand calculation |
@@ -541,8 +794,13 @@ The Retail Prices API is **anonymous** — no auth, no subscription context. Pri
 
 - [Azure Retail Prices API](https://learn.microsoft.com/en-us/rest/api/cost-management/retail-prices/azure-retail-prices)
 - [Azure Monitor — Metrics: List](https://learn.microsoft.com/en-us/rest/api/monitor/metrics/list)
+- [Monitor model deployments in Microsoft Foundry Models](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/how-to/monitor-models)
 - [Cost Management — Query: Usage](https://learn.microsoft.com/en-us/rest/api/cost-management/query/usage)
-- [Monitor Azure OpenAI](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/how-to/monitor-openai)
+- [Plan and manage costs for Microsoft Foundry](https://learn.microsoft.com/en-us/azure/foundry/concepts/manage-costs)
+- [Claude models in Microsoft Foundry](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/claude-models)
+- [Claude Consumption Units (CCU) billing](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/claude-models-billing)
+- [Claude model quotas and rate limits](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/claude-models-quotas-limits)
+- [Foundry SDKs and endpoints (Anthropic SDK)](https://learn.microsoft.com/en-us/azure/foundry/how-to/develop/sdk-overview)
 - [Models — List (Foundry catalog)](https://learn.microsoft.com/en-us/rest/api/aiservices/accountmanagement/models/list)
 - [Deployment types](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/deployment-types)
 
