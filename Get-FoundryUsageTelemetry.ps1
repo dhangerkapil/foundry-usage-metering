@@ -186,6 +186,7 @@ function Get-ProviderProfile {
                 HasLatencyBlock   = $false
                 # message_start usage is partial; the final one wins.
                 UseLastUsageMatch = $true
+                CcuBilled         = $true
                 BillingNote       = 'CCU via Azure Marketplace - no per-model cost meter'
             }
             break
@@ -203,6 +204,7 @@ function Get-ProviderProfile {
                 HasTotalTokens    = $true
                 HasLatencyBlock   = $false
                 UseLastUsageMatch = $false
+                CcuBilled         = $false
                 BillingNote       = 'Retail Prices API'
             }
             break
@@ -222,6 +224,7 @@ function Get-ProviderProfile {
                 HasTotalTokens    = $true
                 HasLatencyBlock   = ($Publisher -eq 'OpenAI')
                 UseLastUsageMatch = $false
+                CcuBilled         = $false
                 BillingNote       = 'Retail Prices API'
             }
         }
@@ -380,14 +383,26 @@ function Invoke-MeteredCompletion {
         }
 
         $sw  = [System.Diagnostics.Stopwatch]::StartNew()
-        $raw = & curl.exe @cargs
-        $sw.Stop()
-        Remove-Item $tmp -ErrorAction SilentlyContinue
+        try   { $raw = & curl.exe @cargs }
+        finally {
+            # finally, not a bare call after the invocation: with
+            # $ErrorActionPreference='Stop' a curl failure would skip the cleanup
+            # and leak the request body into TEMP on every failed call.
+            $sw.Stop()
+            Remove-Item $tmp -ErrorAction SilentlyContinue
+        }
 
         $joined = $raw -join "`n"
 
         # Adapt and retry once on the output-limit parameter mismatch.
+        # Both conditions are required. Matching the bare word anywhere in the
+        # body is not safe: a SUCCESSFUL completion whose text happens to discuss
+        # "max_completion_tokens" would match, discarding a response that was
+        # already charged upstream and billing only the retry. Requiring a
+        # genuine top-level error object avoids that - JSON escaping turns any
+        # model-authored quotes into \" so content cannot forge an error block.
         if ($attempt -eq 1 -and -not $useCompletionTokens -and
+            $joined -match '"error"\s*:\s*\{' -and
             $joined -match 'max_completion_tokens') {
             Write-Verbose "'$Deployment' requires max_completion_tokens; retrying."
             $useCompletionTokens = $true
@@ -442,15 +457,31 @@ function Invoke-MeteredCompletion {
 
     $n = ConvertTo-NormalizedUsage -Usage $usage -ProviderProfile $prof
 
-    $cost = $null
-    $price = if ($PriceTable) { $PriceTable[$Deployment] } else { $null }
-    if ($price) {
+    # CCU INVARIANT. Claude bills in Claude Consumption Units through Azure
+    # Marketplace as a single aggregate meter with no per-model dimension, so a
+    # per-model cost is not merely unknown - it does not exist. Compute it here
+    # and the inline meter would emit a fabricated number, contradicting the
+    # whole premise. Tokens stay exact; cost is null by design, and BillingModel
+    # says which kind of null this is so a caller can tell "impossible" from
+    # "missing price", exactly as Get-NearRealTimeCost does.
+    $cost         = $null
+    $billingModel = 'NoMeter'
+    $price        = if ($PriceTable) { $PriceTable[$Deployment] } else { $null }
+
+    if ($prof.CcuBilled) {
+        $billingModel = 'CCU'
+    }
+    elseif ($price) {
+        $billingModel = 'Derived'
         # Cached input bills at the cached rate when the model exposes one.
         # Anthropic additionally charges a PREMIUM for cache writes; when no
         # explicit write rate is known, fall back to the standard input rate
         # rather than treating the write as free.
-        $cachedRate = if ($price.CachedInputPer1M) { $price.CachedInputPer1M } else { $price.InputPer1M }
-        $writeRate  = if ($price.CacheWritePer1M)  { $price.CacheWritePer1M }  else { $price.InputPer1M }
+        # $null -ne, not truthiness: a genuine 0.0 rate (some tiers price cache
+        # reads at zero) is falsy in PowerShell and would silently fall back to
+        # the FULL input rate, overcharging the customer.
+        $cachedRate = if ($null -ne $price.CachedInputPer1M) { $price.CachedInputPer1M } else { $price.InputPer1M }
+        $writeRate  = if ($null -ne $price.CacheWritePer1M)  { $price.CacheWritePer1M }  else { $price.InputPer1M }
         $cost = [math]::Round(
             ($n.InputTokens      / 1000000 * $price.InputPer1M) +
             ($n.CachedReadTokens / 1000000 * $cachedRate) +
@@ -470,6 +501,7 @@ function Invoke-MeteredCompletion {
         Reasoning     = $n.ReasoningTokens
         TotalTokens   = $n.TotalTokens
         CostUSD       = $cost
+        BillingModel  = $billingModel
         PriceKnown    = [bool]$price
         WallClockMs   = [int]$sw.ElapsedMilliseconds
         # Per-request latency telemetry, free with the response - OpenAI only.
@@ -796,9 +828,20 @@ function Get-NearRealTimeCost {
         #   gpt-4.1-mini     in 1639   out 739     total 2378    -> total-in = out
         #   grok-4.3         in 34     out 99      total 998     -> total-in = 964
         # So it equals OutputTokens where the publisher is consistent and
-        # recovers the missing reasoning tokens where it is not. Self-healing,
-        # and it needs no per-publisher branching here.
-        $billableOut = if ($null -ne $tot -and $null -ne $in -and $tot -gt 0) { $tot - $in } else { $out }
+        # recovers the missing reasoning tokens where it is not.
+        #
+        # The fallback is NOT equivalent. If the TotalTokens series is missing
+        # for a window, raw OutputTokens reintroduces exactly the xAI
+        # under-report this function exists to prevent, so say so rather than
+        # quietly emitting a low number.
+        if ($null -ne $tot -and $null -ne $in -and $tot -gt 0) {
+            $billableOut = $tot - $in
+        }
+        else {
+            $billableOut = $out
+            Write-Warning ("No TotalTokens for '{0}' in this window; falling back to raw OutputTokens. " -f $model +
+                           "This UNDER-REPORTS output on publishers that exclude reasoning tokens (xAI). Widen -LookbackMins or re-poll.")
+        }
 
         $price = $PriceTable[$model]
         $cost  = $null
@@ -857,7 +900,13 @@ else {
     $targets = if ($Deployment) {
         $deployments | Where-Object { $_.Deployment -eq $Deployment }
     } else {
-        $deployments | Group-Object Publisher | ForEach-Object { $_.Group[0] }
+        # Exclude non-chat deployments before picking. Embedding, audio and image
+        # models carry format='OpenAI' too, so an unfiltered Group[0] can hand a
+        # chat-completions payload to an embedding deployment purely on ARM
+        # ordering - a confusing first-run failure that looks like a bug here.
+        $deployments |
+            Where-Object { $_.Model -notmatch 'embedding|whisper|tts|dall-e|sora|image|audio|realtime|moderation' } |
+            Group-Object Publisher | ForEach-Object { $_.Group[0] }
     }
 
     if (-not $targets) { Write-Warning "Deployment '$Deployment' not found on '$AccountName'." }

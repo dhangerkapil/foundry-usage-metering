@@ -219,13 +219,31 @@ function Build-FoundryPriceTable {
     )
 
     # Serve from cache when fresh enough.
+    # Schema version. Bump this whenever parsing or lookup logic changes, so a
+    # cache written by an older build is rebuilt rather than served. Without it,
+    # a bug fixed today keeps returning wrong prices from yesterday's cache for
+    # up to -MaxAgeHours.
+    $script:PriceTableSchema = 2
+
     if ($CachePath -and -not $Force -and (Test-Path $CachePath)) {
         try {
             $cached = Get-Content $CachePath -Raw | ConvertFrom-Json
             $age = (Get-Date).ToUniversalTime() - [datetime]::Parse($cached.BuiltAtUtc).ToUniversalTime()
-            if ($age.TotalHours -lt $MaxAgeHours -and $cached.Region -eq $Region) {
+            # Validate completeness as well as freshness. A partial write that
+            # still parses as JSON would otherwise be served as a complete
+            # table, silently turning priced models into NoMeter.
+            $complete = ($null -ne $cached.Entries) -and
+                        ($cached.MeterCount -eq @($cached.Entries).Count)
+            $sameSchema = ($cached.Schema -eq $script:PriceTableSchema)
+            if ($age.TotalHours -lt $MaxAgeHours -and $cached.Region -eq $Region -and $complete -and $sameSchema) {
                 Write-Verbose "Price cache hit ($([math]::Round($age.TotalHours,1))h old)"
                 return $cached
+            }
+            if (-not $complete) {
+                Write-Warning "Price cache is incomplete (MeterCount $($cached.MeterCount) vs $(@($cached.Entries).Count) entries) - rebuilding rather than serving a partial table."
+            }
+            elseif (-not $sameSchema) {
+                Write-Verbose "Price cache schema $($cached.Schema) != $($script:PriceTableSchema); rebuilding."
             }
         } catch { Write-Warning "Price cache unreadable, rebuilding: $($_.Exception.Message)" }
     }
@@ -284,6 +302,7 @@ function Build-FoundryPriceTable {
     $table = [pscustomobject]@{
         Region       = $Region
         BuiltAtUtc   = (Get-Date).ToUniversalTime().ToString('o')
+        Schema       = $script:PriceTableSchema
         MeterCount   = $entries.Count
         RawRowCount  = $raw.Count
         Entries      = $entries
@@ -378,6 +397,12 @@ function Get-TokenPrice {
         default    { 'Standard' }
     }
 
+    # Fireworks-hosted meters are a separate SKU with their own rates, so the
+    # host must match the publisher rather than being hardcoded. Pinning this to
+    # 'AzureDirect' made every model in the Fireworks family unreachable -
+    # advertised in the family map but permanently NoMeter.
+    $wantHost = if ($Publisher -eq 'Fireworks') { 'Fireworks' } else { 'AzureDirect' }
+
     $candidates = $Table.Entries | Where-Object {
         $_.Kind           -eq $Kind        -and
         $_.Scope          -eq $scope       -and
@@ -385,7 +410,7 @@ function Get-TokenPrice {
         $_.DeploymentType -eq $depType     -and
         $_.Modality       -eq $Modality    -and
         $_.Purpose        -eq $Purpose     -and
-        $_.Host           -eq 'AzureDirect'
+        $_.Host           -eq $wantHost
     }
 
     # Narrow to this model. meterName carries abbreviations, not model IDs, so
@@ -402,6 +427,16 @@ function Get-TokenPrice {
     elseif ($Publisher) {
         return New-Result 'UnknownPublisher' $null $null `
             "Publisher '$Publisher' is not in the family map. No verdict claimed - add it rather than assuming a price."
+    }
+    else {
+        # An ABSENT publisher must refuse exactly like an unknown one. Falling
+        # through with no family filter lets a version token collide across
+        # publishers and return a confident price from the wrong vendor:
+        # 'MM3.5' (Mistral) matched 'GPT 5 Inpt Glbl' and was priced at $1.25
+        # instead of its own $1.50. The publisher is always available from the
+        # ARM deployment's properties.model.format - pass it.
+        return New-Result 'UnknownPublisher' $null $null `
+            "No -Publisher supplied. Version tokens collide across vendors (Mistral 'MM3.5' matches a GPT-5 meter), so no price is claimed. Resolve the publisher from the ARM deployment's properties.model.format and pass it."
     }
 
     # Narrow to this model. meterName carries abbreviations, not model IDs, so
@@ -491,7 +526,15 @@ function Get-TokenPrice {
         $t = $Text.ToLowerInvariant() -replace '[\-_]', ' '
         $found = [System.Collections.Generic.SortedSet[string]]::new()
         foreach ($v in $Aliases.Keys) {
-            if ($t -match "(^|\s)($($Aliases[$v]))(\s|$)") { [void]$found.Add($v) }
+            # Trailing boundary is (?![a-z]) rather than (\s|$) because meter
+            # names GLUE the variant to what follows: 'gpt-4-turbo128K' has no
+            # separator between 'turbo' and '128K'. Requiring whitespace made
+            # that meter report variant '' - identical to base 'gpt-4' - so
+            # plain gpt-4 (real rate $30/$60) resolved to the turbo meter at
+            # $10/$30, a 56% under-bill, while real 'gpt-4-turbo' got NoMeter.
+            # Leading boundary stays (^|\s) so a variant glued to the END of a
+            # preceding token cannot match spuriously.
+            if ($t -match "(^|\s)($($Aliases[$v]))(?![a-z])") { [void]$found.Add($v) }
         }
         ($found -join '+')
     }
@@ -530,8 +573,14 @@ function Get-TokenPrice {
             # Pull MMDD from anywhere in the string rather than anchoring, and
             # say so when it cannot be used - the caller supplied disambiguating
             # information and deserves to know it was ignored.
-            $mmdd = if ($ModelVersion -match '(\d{2})-(\d{2})(?!\d)') { "$($Matches[1])$($Matches[2])" }
-                    elseif ($ModelVersion -match '^\d{4}$')           { $ModelVersion }
+            # Anchor on the full yyyy-MM-dd. An unanchored (\d{2})-(\d{2}) scans
+            # left to right and matches the WRONG pair: '2024-11-20' yields
+            # '24-11' -> '2411', which matches no meter, so a caller who
+            # correctly supplied the version silently got Ambiguous. gpt-4o
+            # 0513 and 1120 differ 2x ($5.00 vs $2.50), so this is exactly the
+            # case -ModelVersion exists to resolve.
+            $mmdd = if ($ModelVersion -match '\d{4}-(\d{2})-(\d{2})(?!\d)') { "$($Matches[1])$($Matches[2])" }
+                    elseif ($ModelVersion -match '^\d{4}$')                 { $ModelVersion }
                     else { $null }
             if ($mmdd) {
                 $dated = @($candidates | Where-Object {
@@ -670,6 +719,23 @@ function Measure-RequestCost {
             Status      = "Unpriced: input=$($inP.Status) output=$($outP.Status)"
             Note        = ($inP.Note, $outP.Note | Where-Object { $_ }) -join ' / '
             IsListPrice = $Table.IsListPrice
+        }
+    }
+
+    # Clamp EVERY leg, not just billable input. An upstream parse bug or a -1
+    # sentinel would otherwise emit a NEGATIVE invoice line reported as
+    # 'Priced' - a credit nobody authorised. Reject the input instead.
+    foreach ($leg in @(
+        @{ n='InputTokens'; v=$InputTokens }, @{ n='OutputTokens'; v=$OutputTokens },
+        @{ n='CachedTokens'; v=$CachedTokens }, @{ n='CacheWriteTokens'; v=$CacheWriteTokens })) {
+        if ($leg.v -lt 0) {
+            return [pscustomobject]@{
+                ModelName   = $ModelName
+                CostUSD     = $null
+                Status      = 'InvalidInput'
+                Note        = "$($leg.n) is negative ($($leg.v)). Token counts cannot be negative; this indicates an upstream parsing fault. No cost claimed."
+                IsListPrice = $Table.IsListPrice
+            }
         }
     }
 

@@ -137,7 +137,7 @@ event: message_delta   usage: { input_tokens: 10, output_tokens: 13 }   <- FINAL
 A `[regex]::Match` that takes the **first** hit records 1 output token instead of 13. Take the
 **last** usage object on an Anthropic stream.
 
-### ⚠️ Every current OpenAI flagship rejects `max_tokens`
+### ⚠️ Every current OpenAI *reasoning* flagship rejects `max_tokens`
 
 | Parameter | Models |
 |---|---|
@@ -235,9 +235,40 @@ silently at the standard rate, so comparing these two is the only way to detect 
 
 - **No tenant dimension.** Hence inline metering.
 - **`TokensCacheMatchRate` and `ProvisionedConsumedTokens` are PTU-only.** Claude runs Global
-  Standard / Data Zone Standard, so there is no cache hit-rate metric for it.
-- **No project-level cost attribution for Marketplace models.** Chargeback by project does not
-  cover Claude.
+  Standard / Data Zone Standard, so there is no cache *hit-rate* metric for it. Cache *counts*
+  do exist — see below.
+- **Per-model cost is largely unpopulated.** A `FoundryModelEstimatedCost` metric exists
+  (dimensions `ProjectId`, `ModelDeploymentName`, `ModelName`, `ModelVersion`, `Region`), but
+  measured over a 6-hour window on an account where **10 deployments produced tokens, only 2
+  returned a cost value** — both OpenAI. Anthropic, xAI and DeepSeek returned none, and so did
+  three OpenAI deployments. Treat it as a portal convenience, not a billing source.
+
+### ⚠️ Cache tokens behave in opposite directions by publisher
+
+This is the easiest way to send a wrong invoice from Monitor, and it is invisible unless you
+look for it. Two controlled single-request tests, same account, same hour:
+
+| | Anthropic (`claude-opus-5`) | OpenAI (`gpt-4.1-mini`) |
+|---|---|---|
+| Inline | in 26, cacheWrite 7,283, cacheRead 7,283, out 22 | prompt 5,072 (**incl.** cached 2,432), completion 2 |
+| `InputTokens` | 26 — **excludes** cache | 5,072 — **includes** cache |
+| `TotalTokens` | **48** (= in + out only) | 5,074 |
+| `cacheReadInputTokens` | 7,283 | **0** (not populated) |
+| `ephemeral5mInputTokens` | 7,283 (the cache *write*) | 0 |
+
+**Anthropic — under-bill.** Cache tokens are outside `TotalTokens` entirely. Billing
+`InputTokens + (TotalTokens − InputTokens)` charges **48 tokens against a real billable volume
+of 14,614**. Cache writes bill at a *premium*, so the omission is not a rounding error. You
+must add `cacheReadInputTokens` (read) and `ephemeral5mInputTokens + ephemeral1hInputTokens`
+(write, split by TTL) — four metrics, not two.
+
+**OpenAI — over-bill.** Cache is folded *into* `InputTokens` and the cache metric stays `0`, so
+Monitor alone cannot tell you how much was cached. Billing all of it at the full input rate
+overcharges the cached portion, which prices at a fraction of standard input. In the test above
+**48% of input was cached and invisible**. Only the inline `usage` block
+(`prompt_tokens_details.cached_tokens`) or the per-request log can separate it.
+
+Same metric names, opposite semantics, opposite error directions.
 
 ### ⚠️ Monitor inherits the reasoning-token quirk too
 
@@ -268,6 +299,24 @@ the missing tokens wherever it is not:
 | gpt-4.1-mini | 1,639 | 739 | 2,378 | 739 | ✅ |
 | **grok-4.3** | 34 | 99 | 998 | **964** | ❌ — reasoning recovered |
 
+Verified again on an isolated single request rather than an aggregate: grok-4.3 inline reported
+`prompt 29 / completion 66 / reasoning 634 / total 729`, and Monitor reported `In 29 / Out 66 /
+Total 729`. `Total − In` = **700** = `completion + reasoning`.
+
+**Two limits on this rule, both measured:**
+
+1. **It covers output only, not the whole bill.** Cache tokens are not inside `TotalTokens` for
+   Anthropic — see the cache section above. `Total − In` gives you correct *output*; it does not
+   give you a complete invoice.
+2. **It is exact only over a quiescent window.** Across 17 consecutive one-minute buckets,
+   `Total − In == Out` held in 16. The one miss (−7,418) was a request straddling a bucket
+   boundary under concurrent load, not a semantic difference. Reconcile over windows with idle
+   edges, or tolerate a small boundary delta.
+
+Note this is an **observed** behaviour. Microsoft documents `TotalTokens` as the sum of input
+and output; the xAI divergence is not a published contract, so re-verify it rather than
+assuming it is stable.
+
 `Get-NearRealTimeCost` does this automatically and reports the raw metric alongside it as
 `ReportedOutput`, so the divergence stays visible rather than being silently papered over.
 
@@ -293,7 +342,10 @@ off by default, it is not in the portal Metrics blade, and it covers one publish
 - **¹** `OutputTokens` excludes reasoning tokens. Bill `TotalTokens − InputTokens`.
 - **²** Log Analytics ingestion; documented as up to 15 min, observed ~2 min.
 - **³** **Zero rows.** Verified over 30 days / 35,114 records on an account actively serving all
-  four publishers: 17 distinct model names, every one OpenAI.
+  four publishers: 17 distinct model names, every one OpenAI. The category name is
+  OpenAI-scoped, which is consistent with this, but Microsoft publishes no per-publisher
+  coverage statement — so this is a measurement, not a documented limit. Re-check it for your
+  own account before designing around it.
 - **⁴** Logged, but with **no token counts** — only byte lengths and timing.
 - **⁵** Different field names, different cache semantics, different streaming rules. This is what
   `Get-ProviderProfile` and `ConvertTo-NormalizedUsage` exist to absorb.
@@ -363,6 +415,12 @@ Plus `CorrelationId`, `TimeGenerated` and `_ResourceId` on the envelope.
   which the inline path cannot give you on a streamed call.
 
 ### The join key is `apim-request-id`
+
+> **Observed, not documented.** Microsoft publishes no schema for
+> `AzureOpenAIRequestUsage` and no statement that `CorrelationId` equals any response header.
+> Everything in this section is measured behaviour on a live account. It works today and it is
+> the only join available, but treat it as an implementation detail to re-verify, not a
+> contract to build an unmonitored billing pipeline on.
 
 `CorrelationId` on the log row equals the **`apim-request-id`** response header. That is the
 field to persist in your gateway if you want per-request settlement.
@@ -808,6 +866,14 @@ or a parsing defect.
 - [ ] Poll Azure Monitor every 1–5 minutes as the cross-publisher source of truth
 - [ ] **Bill `TotalTokens − InputTokens`, never `OutputTokens`** — Monitor carries the same xAI
       reasoning exclusion as the inference API
+- [ ] **Add the cache metrics for Anthropic** — `cacheReadInputTokens` plus
+      `ephemeral5mInputTokens` + `ephemeral1hInputTokens`. They sit *outside* `TotalTokens`, so
+      input+output alone under-bills a cache-heavy Claude request by orders of magnitude
+- [ ] **Do not bill OpenAI `InputTokens` at the full input rate** — it already includes cache
+      reads, which Monitor does not break out. Take the cached split from the inline
+      `prompt_tokens_details.cached_tokens` or the per-request log
+- [ ] Reconcile over windows with idle edges; a request straddling a minute boundary makes
+      `Total − In` differ from `Out` without anything being wrong
 - [ ] Alert when `monitor_tokens − gateway_tokens` exceeds a threshold
 - [ ] Never record zero tokens from a missing usage block — mark the window unknown and let
       Monitor settle it
