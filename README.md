@@ -53,8 +53,7 @@ Each of these produces a confident, plausible, wrong number. None of them raises
 
 ### 1. Do not bill `TotalTokens − InputTokens`
 
-This is advice you will find in a lot of places, including earlier drafts of this README. It is
-wrong, and on a reasoning workload it is wrong by an order of magnitude.
+Billing `TotalTokens − InputTokens` can overcharge reasoning workloads by an order of magnitude.
 
 `grok-4.3` puts reasoning tokens **inside** `TotalTokens` and **outside** `OutputTokens`. That
 looks like `OutputTokens` is under-reporting. It is not — **Azure does not bill those reasoning
@@ -163,9 +162,8 @@ outright.
 
 **On the host name:** all three of `<account>.services.ai.azure.com`,
 `<account>.openai.azure.com` and `<account>.cognitiveservices.azure.com` route **both**
-`/openai/v1/chat/completions` and `/anthropic/v1/messages` (tested 2026-10-07). An earlier
-version of this document claimed `.openai.azure.com` does not route `/anthropic`; that is not
-true on this account. Use `.services.ai.azure.com` as the canonical host anyway — it is the one
+`/openai/v1/chat/completions` and `/anthropic/v1/messages` (tested 2026-10-07).
+Use `.services.ai.azure.com` as the canonical host — it is the one
 Microsoft documents for the unified surface.
 
 ### xAI excludes reasoning tokens from `completion_tokens`
@@ -683,10 +681,10 @@ appears as a per-token meter. `-Sku ProvisionedManaged` returns `BilledAsCapacit
 
 A substring match would bill `gpt-5.4` at the `pro` rate — **12× over**.
 
-Two subtleties that cost real money, both found by review rather than testing:
+Two matching rules prevent incorrect prices:
 
-- **The filter must be unconditional.** An earlier version skipped it when it matched nothing,
-  letting a base model fall back onto a variant's meter — `gpt-5.3` was priced from `5.3 codex`.
+- **The filter must be unconditional.** Skipping it when it matches nothing lets a base model
+  fall back onto a variant's meter — for example, pricing `gpt-5.3` from `5.3 codex`.
   An empty result means `NoMeter`, not permission to keep the unfiltered set.
 - **The version token must be anchored.** `20` is a substring of `120`, and `4` is a token of
   `gpt-4-turbo128K`. Unanchored, `gpt-oss-20b` priced from the `120B` meter and `gpt-4o` from
@@ -734,9 +732,8 @@ Ambiguous                0
 Anthropic, xAI, DeepSeek, Mistral AI, Microsoft, Meta, Cohere, Alibaba and MoonshotAI. Not
 covered: Black Forest Labs, AI21 Labs, Core42, NTT DATA, Nixtla, Stability AI.
 
-A looser matcher reaches a far higher "coverage" number — earlier drafts did, and every point of
-that extra coverage was wrong. Several of those historical loose matches now resolve correctly
-with the strict matcher; the point is the failure mode, not the specific models:
+A looser matcher can increase apparent coverage by returning incorrect prices. The table
+compares loose-match errors with strict-matcher results:
 
 | Model | Loose match resolved to | Error | Strict matcher today |
 |---|---|---|---|
