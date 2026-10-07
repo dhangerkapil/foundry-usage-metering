@@ -1,581 +1,391 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
-    Reference sample: real-time pricing, model catalog, token usage and cost
-    telemetry for an AI gateway built on Microsoft Foundry.
+    Reference sample: model catalog, unit pricing, per-request metering, token
+    usage and cost telemetry for an AI gateway built on Microsoft Foundry.
 
 .DESCRIPTION
-    Demonstrates the Azure APIs an AI gateway needs to surface usage metrics to
-    its own tenants, and shows the correct way to combine them.
+    Shows the Azure APIs an AI gateway needs to report usage and cost to its
+    own tenants, and the correct way to combine them.
 
-      1. Model catalog   - ARM CognitiveServices models        (real time)
-      2. Unit pricing    - Azure Retail Prices API             (static, cache daily)
-      3. Token usage     - Azure Monitor metrics               (~1-3 min lag)
-      4. Billed cost     - Cost Management Query API           (hours lag, throttled)
+      1. Catalog, deployments - ARM                         (real time)
+      2. Unit pricing         - Azure Retail Prices API     (list prices; cache daily)
+      3. Inline metering      - the inference response      (per request)
+      4. Token usage          - Azure Monitor metrics       (about 1 min behind)
+      5. Near-real-time cost  - (4) x (2)                   (about 1 min behind)
+      6. Billed cost          - Cost Management Query API   (hours behind; throttled)
 
-    KEY ARCHITECTURAL POINT #1 - AZURE MONITOR IS THE PREFERRED SOURCE
-    Azure Monitor is the only surface that reports token usage identically for
-    every model publisher. Its InputTokens / OutputTokens / TotalTokens metrics
-    carry the same name, unit and dimensions whether the deployment is OpenAI,
-    Anthropic, xAI or DeepSeek. Every other source is provider-shaped:
-    the inference response differs per publisher, and Anthropic is not in the
-    Retail Prices API at all. Treat Monitor as the source of truth for totals,
-    reconciliation and anything that must span publishers.
+    Section 5 is a join, not a data source. A sixth source, the per-request
+    diagnostic logs (RequestResponse and AzureOpenAIRequestUsage in Log
+    Analytics), needs a diagnostic setting on the account, so this script does
+    not read it; the README covers it.
 
-    KEY ARCHITECTURAL POINT #2 - MONITOR CANNOT REPLACE INLINE METERING
-    Monitor's dimensions are ApiName, Region, ModelDeploymentName, ModelName and
-    ModelVersion. There is NO tenant dimension. If a gateway must attribute spend
-    to the tenant that made the call, that attribution can only happen in the
-    request path. So inline metering stays - but it must be provider-aware,
-    because each publisher reports usage differently (see Get-ProviderProfile).
+    KEY POINT #1 - AZURE MONITOR: ONE SCHEMA, DIFFERENT SEMANTICS
+    Azure Monitor reports tokens under the same metric names for every
+    publisher - InputTokens, OutputTokens, TotalTokens - split by deployment,
+    model and version. The names match; the meaning does not:
+      * OpenAI-path InputTokens INCLUDE cached and cache-write tokens. Claude's
+        InputTokens EXCLUDE them; Claude cache traffic has its own metrics.
+      * xAI OutputTokens EXCLUDE reasoning, which appears only in TotalTokens.
+        Azure did not bill that reasoning: for grok-4.3, billed output equalled
+        OutputTokens exactly (Cost Management, Oct 2026). Price InputTokens and
+        OutputTokens; never TotalTokens - InputTokens.
+      * Monitor is close to the bill, not equal to it. Over 124 deployment-days
+        of OpenAI-path traffic, billed quantities matched InputTokens and
+        OutputTokens exactly on 86. Busy days were within about 5%; quiet days
+        were billed in part or not at all.
+      * One metrics request covers at most 31 days. A longer timespan is
+        silently shortened to its last 31 days (HTTP 200), so query longer
+        periods in pieces.
+    Use Monitor for totals and for catching traffic that bypassed the gateway;
+    use Cost Management for the invoice.
 
-    KEY ARCHITECTURAL POINT #3 - DO NOT POLL COST MANAGEMENT
-    It lags by hours and is aggressively throttled. Compute cost from token
-    counts and cached unit prices; use Cost Management only for reconciliation.
-    For Anthropic, per-model cost reconciliation is impossible by design - see
-    the CCU note below.
+    KEY POINT #2 - NO TENANT DIMENSION
+    Monitor splits by deployment, model, version, region and API - never by
+    caller. The diagnostic logs carry the caller's object ID, which behind a
+    gateway is the gateway's own identity. Per-tenant attribution has to
+    happen in the request path, and it has to be provider-aware, because each
+    publisher reports usage differently (section 3).
 
-    ANTHROPIC / CLAUDE BILLS IN CCU
-    Claude models bill through Azure Marketplace in Claude Consumption Units.
-    Azure Cost Management shows a SINGLE CCU meter with no per-model dimension,
-    so derived cost (billed / tokens) cannot be computed per Claude model. This
-    is documented behaviour, not a coverage gap. Token usage is still exact and
-    available from Azure Monitor and from the inference response.
+    KEY POINT #3 - RECONCILE PER DEPLOYMENT, NOT PER MODEL
+    Cost Management rows carry a 'deployment' tag (value lowercased) that
+    joins to Monitor's ModelDeploymentName. Model names do not join: a
+    deployment named gpt-5-chat can run the model gpt-chat-latest, and meter
+    names are abbreviations ('gpt 4.1 Inp glbl Tokens'). Never add quantities
+    across meters: Cost Management's UnitOfMeasure is '1M' on some token meters
+    and '1K' on others. Three cases need care:
+      * Claude is not billed on the Foundry account at all (below).
+      * model-router bills a router fee ('Model Routers GL 1M Tokens', listed
+        under serviceName 'Foundry Tools' in the Retail Prices API) plus the
+        meters of each model it routed to, all tagged with the router's
+        deployment.
+      * Some models bill on meters with no list price: DeepSeek-V4.1-Flash
+        bills on 'DS30 1M Tokens' and 'DS31 1M Tokens', which only Cost
+        Management shows.
+
+    ANTHROPIC / CLAUDE BILLS THROUGH AZURE MARKETPLACE
+    Claude is not in the Retail Prices API and is not billed on the Foundry
+    account. Its charges land on Marketplace SaaS resources (MeterCategory
+    'SaaS'), so a Cost Management query scoped to the account shows no
+    Claude spend. New deployments bill in Claude Consumption Units (CCU);
+    deployments created before CCU billing became generally available keep
+    their per-model token plan, with meters such as 'Claude Sonnet 4.6 -
+    msft-sonnet-4-6-flat-100 - paygo-inference-input-tokens'. A CCU meter
+    names the plan and the hosting ('Azure hosted' or 'Anthropic hosted'),
+    never the model, and the rows carry no deployment tag. Every Claude
+    resource seen was named '<Claude name, cut to 15 characters>-<first 15
+    characters of the account's internalId>-<32 hex digits>'. The middle
+    part ties a resource to its account; the Claude name does not identify
+    the deployment: claude-opus-5's usage was billed on a resource named
+    'claude-opus-5-5-...'. Claude token counts are exact in the response;
+    Claude cost per deployment can only be estimated. See
+    https://learn.microsoft.com/azure/foundry/foundry-models/concepts/claude-models-billing
+
+.PARAMETER AccountName
+    The Foundry (Microsoft.CognitiveServices) account name.
+
+.PARAMETER SubscriptionId
+    Defaults to the Azure CLI's current subscription.
+
+.PARAMETER ResourceGroup
+    Looked up from the account name when omitted.
+
+.PARAMETER Region
+    Region for the model catalog and the price table. Defaults to the
+    account's location.
+
+.PARAMETER Deployment
+    The deployment section 3 calls. Default: one chat deployment per publisher,
+    excluding model-router - name it here to exercise router pricing.
+
+.PARAMETER LookbackMins
+    Azure Monitor window for sections 4 and 5: 1 to 44640 minutes (31 days,
+    the most one metrics request covers).
+
+.PARAMETER IncludeCost
+    Also run section 6: billed cost for the last 5 UTC days plus today. Slow
+    and throttled.
+
+.PARAMETER SkipInference
+    Skip section 3, so no tokens are spent. Use it for an identity without
+    data-plane access to the account.
+
+.EXAMPLE
+    ./Get-FoundryUsageTelemetry.ps1 -AccountName my-foundry
+
+.EXAMPLE
+    ./Get-FoundryUsageTelemetry.ps1 -AccountName my-foundry -Deployment model-router -LookbackMins 1440 -IncludeCost
 
 .NOTES
-    Auth: all use Entra tokens. No API keys.
-      - ARM / Monitor / Cost Management -> audience https://management.azure.com
-      - Inference (both endpoints)      -> audience https://cognitiveservices.azure.com
-      - Retail Prices API               -> anonymous, no auth, no subscription
+    Requires PowerShell 7 and the Azure CLI, signed in (az login), with
+    Build-FoundryPriceTable.ps1 in the same folder. Every call uses an Entra
+    token; no API keys.
+      - ARM, Azure Monitor, Cost Management -> audience https://management.azure.com
+      - Inference                           -> audience https://cognitiveservices.azure.com
+      - Retail Prices API                   -> anonymous
 
-    Required RBAC on the Foundry resource / subscription:
-      - Monitoring Reader   (Azure Monitor metrics)
-      - Cost Management Reader (Cost Management query)
-      - Reader              (model catalog)
+    RBAC. These come from the role definitions and the Cost Management docs;
+    least privilege was NOT tested (the test identity held Owner, Foundry
+    User, Cognitive Services User and Cognitive Services OpenAI User):
+      - Sections 1, 4, 5: Reader on the subscription. The model catalog and
+        the account lookup are subscription-scope calls.
+      - Section 2: none - the Retail Prices API is anonymous.
+      - Section 3: data-plane access to the account, e.g. Foundry User (data
+        actions Microsoft.CognitiveServices/*). Without it, use -SkipInference.
+      - Section 6: Reader (or Cost Management Reader) on the subscription. On
+        an Enterprise Agreement the 'AO view charges' setting must be on; on a
+        CSP subscription the partner must enable cost visibility.
 
-    Verified against kd-foundry/eastus2 with live deployments from four
-    publishers: OpenAI, Anthropic, xAI and DeepSeek.
+    Verified in October 2026 against a Foundry (AIServices) account in eastus2
+    with OpenAI, Anthropic, xAI and DeepSeek deployments.
 #>
 
 [CmdletBinding()]
 param(
+    [Parameter(Mandatory)][string] $AccountName,
     [string] $SubscriptionId,
     [string] $ResourceGroup,
-    [Parameter(Mandatory)][string] $AccountName,
-    [string] $Region       = "eastus2",
+    [string] $Region,
     [string] $Deployment,
-    [int]    $LookbackMins = 60,
-    [switch] $IncludeCost
+    [ValidateRange(1, 44640)][int] $LookbackMins = 60,
+    [switch] $IncludeCost,
+    [switch] $SkipInference
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
 
-function Get-ArmToken {
-    az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
+# ------------------------------- HELPERS ------------------------------------
+
+function Get-EntraToken {
+    # Entra access token for one audience, from the Azure CLI's signed-in
+    # identity. --subscription selects that subscription's tenant.
+    param(
+        [Parameter(Mandatory)][string] $Resource,
+        [string] $SubscriptionId
+    )
+    $azArgs = @('account', 'get-access-token', '--resource', $Resource, '--query', 'accessToken', '-o', 'tsv')
+    if ($SubscriptionId) { $azArgs += @('--subscription', $SubscriptionId) }
+    $t = az @azArgs
+    if ($LASTEXITCODE -ne 0 -or -not $t) {
+        throw "Could not get a token for '$Resource' from the Azure CLI. Run 'az login', and 'az account set --subscription <id>' if needed."
+    }
+    $t
 }
 
-# Azure throttles several of these endpoints. Always back off rather than fail.
 function Invoke-ArmWithRetry {
-    param($Uri, $Method = "Get", $Body = $null, $Token, [int]$MaxAttempts = 6, [int]$DelaySec = 40)
-    $headers = @{ Authorization = "Bearer $Token"; "Content-Type" = "application/json" }
+    <#
+      One ARM-style REST call (ARM, Azure Monitor, Cost Management) with
+      back-off. Retries 408, 429, 5xx and network errors, honouring every
+      *retry-after header: Cost Management sends
+      x-ms-ratelimit-microsoft.costmanagement-{qpu,entity,tenant,clienttype}-
+      retry-after as well as Retry-After, and waits for the largest. Any other
+      HTTP error throws, with an excerpt of the response body.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Uri,
+        [ValidateSet('Get', 'Post')][string] $Method = 'Get',
+        $Body,
+        [Parameter(Mandatory)][string] $Token,
+        [int] $MaxAttempts = 6,
+        [int] $DelaySec = 5
+    )
+    $p = @{
+        Uri = $Uri; Method = $Method; Headers = @{ Authorization = "Bearer $Token" }
+        SkipHttpErrorCheck = $true; TimeoutSec = 120
+    }
+    if ($null -ne $Body) {
+        $json = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 20 -Compress }
+        $p.Body = [Text.Encoding]::UTF8.GetBytes($json)
+        $p.ContentType = 'application/json'
+    }
+    $where = "$Method $(($Uri -split '\?')[0])"
+    $code  = 0
     for ($i = 1; $i -le $MaxAttempts; $i++) {
-        try {
-            if ($Body) { return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $headers -Body $Body -ErrorAction Stop }
-            else       { return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $headers -ErrorAction Stop }
+        $r = $null; $code = 0
+        try { $r = Invoke-WebRequest @p; $code = [int]$r.StatusCode }
+        catch { Write-Verbose "Network error on attempt $i ($where): $($_.Exception.Message)" }
+
+        if ($code -ge 200 -and $code -lt 300) {
+            $text = [Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray())
+            if (-not $text) { return $null }
+            return ($text | ConvertFrom-Json)
         }
-        catch {
-            $code = $_.Exception.Response.StatusCode.value__
-            if ($code -ne 429 -or $i -eq $MaxAttempts) { throw }
-            Write-Verbose "HTTP 429 on attempt $i; backing off $DelaySec s"
-            Start-Sleep -Seconds $DelaySec
+        if ($code -ne 0 -and $code -notin 408, 429, 500, 502, 503, 504) {
+            $excerpt = [Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()) -replace '\s+', ' '
+            if ($excerpt.Length -gt 400) { $excerpt = $excerpt.Substring(0, 400) }
+            throw "HTTP $code from ${where}: $excerpt"
         }
+        if ($i -eq $MaxAttempts) { break }
+
+        $wait = [math]::Min(120, $DelaySec * [math]::Pow(2, $i - 1))
+        if ($r) {
+            # PowerShell 7 returns each header value as a string array.
+            $hinted = foreach ($k in $r.Headers.Keys) {
+                if ($k -match 'retry-after$') {
+                    $v = (@($r.Headers[$k]) -join ',').Split(',')[0].Trim()
+                    $n = 0
+                    if ([int]::TryParse($v, [ref]$n)) { $n }
+                }
+            }
+            if ($hinted) { $wait = [math]::Min(300, ($hinted | Measure-Object -Maximum).Maximum + 1) }
+        }
+        Write-Verbose "HTTP $code on attempt $i ($where); retrying in $wait s"
+        Start-Sleep -Seconds $wait
     }
+    throw "Gave up on $where after $MaxAttempts attempts (last HTTP status: $code)."
 }
 
-# ---------------------------------------------------------------------------
-# 0. INLINE METERING  -  read usage straight off the inference response
-#
-#    Use this ONLY for per-tenant attribution. Azure Monitor (section 3) is the
-#    preferred source for totals because it is identical across publishers and
-#    cannot be bypassed. Inline metering exists because Monitor has no tenant
-#    dimension - nothing else.
-#
-#    *** INLINE METERING IS PROVIDER-SHAPED. ***
-#    Every publisher reports usage differently. An OpenAI-shaped parser does not
-#    merely degrade on other publishers - it hard-fails on Anthropic and
-#    silently under-bills xAI. All of the following were verified live:
-#
-#    ENDPOINT
-#      OpenAI / xAI / DeepSeek -> /openai/v1/chat/completions
-#      Anthropic               -> /anthropic/v1/messages   + anthropic-version
-#      Calling Anthropic on the OpenAI path returns:
-#        {"error":{"code":"api_not_supported", ...}}       <- HTTP error, no tokens
-#      Omitting anthropic-version returns:
-#        "anthropic-version: header is required"           <- HTTP 400
-#
-#    FIELD NAMES
-#      OpenAI family -> prompt_tokens / completion_tokens / total_tokens
-#      Anthropic     -> input_tokens  / output_tokens      (NO total_tokens)
-#      A parser reading prompt_tokens off Anthropic records 0, not an error.
-#
-#    CACHE SEMANTICS - THE ASYMMETRY THAT BREAKS COST MATH
-#      OpenAI    prompt_tokens INCLUDES cached tokens
-#                -> billable input = prompt_tokens - cached_tokens
-#      Anthropic input_tokens  EXCLUDES cached tokens; cache_read_input_tokens
-#                and cache_creation_input_tokens are SIBLING fields
-#                -> billable input = input_tokens   (NO subtraction)
-#      Subtracting on Anthropic double-discounts. Not subtracting on OpenAI
-#      over-bills. The same code path cannot do both.
-#
-#    REASONING TOKENS - THE EXPENSIVE ONE
-#      OpenAI  reasoning_tokens are INCLUDED in completion_tokens
-#      xAI     reasoning_tokens are EXCLUDED from completion_tokens but are
-#              INCLUDED in total_tokens
-#      Measured on grok-4.3: prompt=13 completion=81 reasoning=451 total=545.
-#      13 + 81 = 94, not 545. A gateway billing completion_tokens charges for
-#      81 output tokens instead of 532 - an 85% under-bill on one request.
-#      Correct for xAI: output = completion_tokens + reasoning_tokens.
-#      Measured on o4-mini:  prompt=15 completion=174 reasoning=128 total=189.
-#      15 + 174 = 189 exactly, so adding reasoning there would DOUBLE-COUNT it.
-#
-#    STREAMING
-#      OpenAI / xAI  omit usage unless stream_options.include_usage = true
-#      Anthropic     ALWAYS streams usage, and REJECTS stream_options outright:
-#                      "stream_options: Extra inputs are not permitted" (400)
-#                    so injecting it universally breaks every streamed Claude call.
-#      Anthropic also emits usage TWICE: message_start carries a PARTIAL
-#      output_tokens, message_delta carries the final one. Measured: 1 then 13.
-#      Taking the first regex match under-bills by whatever streamed after.
-#      Always take the LAST usage object on an Anthropic stream.
-#
-#    OUTPUT-LIMIT PARAMETER
-#      max_tokens            -> gpt-4.x, gpt-4o, model-router, xAI, DeepSeek, Anthropic
-#      max_completion_tokens -> o-series and gpt-5 / gpt-6 reasoning models
-#      Sending the wrong one is HTTP 400, not a warning. Every current OpenAI
-#      flagship rejects max_tokens, so a sample hardcoding it cannot call any
-#      of them. Detect from the error and retry; name lists rot.
-#
-#    LATENCY
-#      OpenAI family exposes usage.latency_checkpoint (engine_ttft_ms etc) on
-#      NON-streamed calls only - it is absent from the streamed usage chunk.
-#      Anthropic does not expose it at all. Measure TTFT at the proxy for both.
-# ---------------------------------------------------------------------------
-
-function Get-ProviderProfile {
-    <#
-      Maps a model publisher to everything that differs about metering it.
-      Publisher comes from the ARM deployment's properties.model.format, which
-      is the only populated publisher field (the 'publisher' field is null on
-      every catalog entry).
-    #>
-    param([Parameter(Mandatory)][string] $Publisher)
-
-    switch -Regex ($Publisher) {
-        '^Anthropic$' {
-            [pscustomobject]@{
-                Provider          = 'Anthropic'
-                Api               = 'AnthropicMessages'
-                PathSuffix        = '/anthropic/v1/messages'
-                ExtraHeaders      = @{ 'anthropic-version' = '2023-06-01' }
-                # Anthropic streams usage unconditionally and 400s on stream_options.
-                UsesStreamOptions = $false
-                # input_tokens already excludes cache reads.
-                InputIncludesCache      = $false
-                # reasoning is not separately reported; output_tokens is complete.
-                OutputIncludesReasoning = $true
-                HasTotalTokens    = $false
-                HasLatencyBlock   = $false
-                # message_start usage is partial; the final one wins.
-                UseLastUsageMatch = $true
-                CcuBilled         = $true
-                BillingNote       = 'CCU via Azure Marketplace - no per-model cost meter'
-            }
-            break
-        }
-        '^xAI$' {
-            [pscustomobject]@{
-                Provider          = 'xAI'
-                Api               = 'OpenAIChatCompletions'
-                PathSuffix        = '/openai/v1/chat/completions'
-                ExtraHeaders      = @{}
-                UsesStreamOptions = $true
-                InputIncludesCache      = $true
-                # THE DEFECT: completion_tokens omits reasoning_tokens.
-                OutputIncludesReasoning = $false
-                HasTotalTokens    = $true
-                HasLatencyBlock   = $false
-                UseLastUsageMatch = $false
-                CcuBilled         = $false
-                BillingNote       = 'Retail Prices API'
-            }
-            break
-        }
-        default {
-            # OpenAI, DeepSeek, Mistral, Meta and other OpenAI-compatible
-            # publishers. DeepSeek omits prompt_tokens_details entirely, which
-            # the normaliser handles by coalescing a null cache count to 0.
-            [pscustomobject]@{
-                Provider          = $Publisher
-                Api               = 'OpenAIChatCompletions'
-                PathSuffix        = '/openai/v1/chat/completions'
-                ExtraHeaders      = @{}
-                UsesStreamOptions = $true
-                InputIncludesCache      = $true
-                OutputIncludesReasoning = $true
-                HasTotalTokens    = $true
-                HasLatencyBlock   = ($Publisher -eq 'OpenAI')
-                UseLastUsageMatch = $false
-                CcuBilled         = $false
-                BillingNote       = 'Retail Prices API'
-            }
-        }
-    }
-}
-
-function ConvertTo-NormalizedUsage {
-    <#
-      Collapses every publisher's usage block into one schema:
-
-        InputTokens       billable input, cache reads already removed
-        CachedReadTokens  input served from cache (cheaper rate)
-        CacheWriteTokens  input written to cache (Anthropic only, premium rate)
-        OutputTokens      billable output, reasoning already included
-        ReasoningTokens   subset of OutputTokens, for visibility only
-        TotalTokens       always recomputed, never trusted from the provider
-
-      TotalTokens is recomputed rather than read because Anthropic does not
-      report one and xAI's disagrees with its own component fields.
-    #>
+function Get-ArmCollection {
+    # Every item of an ARM list, following nextLink. Do not stop at an empty
+    # page: the subscription-wide accounts list has returned an empty first
+    # page with a nextLink, and the account was on a later one.
     param(
-        [Parameter(Mandatory)] $Usage,
-        [Parameter(Mandatory)] $ProviderProfile
+        [Parameter(Mandatory)][string] $Uri,
+        [Parameter(Mandatory)][string] $Token
     )
-
-    if ($ProviderProfile.Api -eq 'AnthropicMessages') {
-        # input_tokens EXCLUDES cache reads - do not subtract.
-        $inTok   = [int]$Usage.input_tokens
-        $cacheRd = [int]$Usage.cache_read_input_tokens
-        $cacheWr = [int]$Usage.cache_creation_input_tokens
-        $outTok  = [int]$Usage.output_tokens
-        $reason  = 0
-    }
-    else {
-        # prompt_tokens INCLUDES cache reads - subtract to get billable input.
-        # DeepSeek has no prompt_tokens_details; [int]$null is 0, which is right.
-        $cacheRd = [int]$Usage.prompt_tokens_details.cached_tokens
-        $inTok   = [int]$Usage.prompt_tokens - $cacheRd
-        $cacheWr = 0
-        $reason  = [int]$Usage.completion_tokens_details.reasoning_tokens
-        $outTok  = [int]$Usage.completion_tokens
-        if (-not $ProviderProfile.OutputIncludesReasoning) {
-            # xAI: reasoning is billed but omitted from completion_tokens.
-            $outTok += $reason
-        }
-    }
-
-    $computedTotal = $inTok + $cacheRd + $cacheWr + $outTok
-    $reported      = if ($ProviderProfile.HasTotalTokens) { [int]$Usage.total_tokens } else { $null }
-
-    # Self-check against the provider's own total. A mismatch means the publisher
-    # changed its accounting and this normaliser needs revisiting - surface it
-    # loudly rather than shipping a quietly wrong invoice.
-    if ($null -ne $reported -and $reported -ne $computedTotal) {
-        Write-Warning ("Usage reconciliation mismatch for {0}: computed {1} vs reported {2}. Token accounting for this publisher may have changed." -f `
-            $ProviderProfile.Provider, $computedTotal, $reported)
-    }
-
-    [pscustomobject]@{
-        Provider         = $ProviderProfile.Provider
-        InputTokens      = $inTok
-        CachedReadTokens = $cacheRd
-        CacheWriteTokens = $cacheWr
-        OutputTokens     = $outTok
-        ReasoningTokens  = $reason
-        TotalTokens      = $computedTotal
-        ReportedTotal    = $reported
+    $next = $Uri
+    while ($next) {
+        $page = Invoke-ArmWithRetry -Uri $next -Token $Token
+        foreach ($item in @($page.value)) { if ($null -ne $item) { $item } }
+        $next = $page.nextLink
     }
 }
 
-function Invoke-MeteredCompletion {
-    <#
-      Provider-aware metering wrapper. Resolves the publisher, picks the right
-      endpoint, headers and payload shape, then normalises the usage block so
-      callers get one schema regardless of who built the model.
-
-      Returns model output plus exact token counts and cost at response time.
-    #>
-    param(
-        [Parameter(Mandatory)] $Endpoint,       # https://<account>.services.ai.azure.com
-        [Parameter(Mandatory)] $Deployment,
-        [Parameter(Mandatory)] $Messages,
-        [Parameter(Mandatory)][string] $Publisher,   # from the ARM deployment: model.format
-        $PriceTable,
-        [int]  $MaxTokens = 256,
-        [switch] $Stream,
-        $Token,
-        [string] $TenantTag = "default"          # your own tenant/user attribution
-    )
-
-    $prof = Get-ProviderProfile -Publisher $Publisher
-
-    if (-not $Token) {
-        $Token = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
+function ConvertTo-DateText($Value) {
+    # 'yyyy-MM-dd' from an ISO date string or a [datetime]. PowerShell 7's
+    # ConvertFrom-Json turns ISO date strings into [datetime] (Kind Utc for a
+    # 'Z' string), so the same field can arrive as either type.
+    if ($null -eq $Value -or "$Value" -eq '') { return $null }
+    if ($Value -is [datetime]) {
+        $d = if ($Value.Kind -eq [DateTimeKind]::Local) { $Value.ToUniversalTime() } else { $Value }
+        return $d.ToString('yyyy-MM-dd', [cultureinfo]::InvariantCulture)
     }
+    ([string]$Value).Split('T')[0]
+}
 
-    # The OpenAI-compatible path has TWO mutually exclusive output-limit
-    # parameters and the model decides which one it accepts:
-    #   max_tokens            - gpt-4.x, gpt-4o, model-router, xAI, DeepSeek
-    #   max_completion_tokens - o-series and gpt-5 / gpt-6 reasoning models
-    # Sending the wrong one is a hard HTTP 400, not a warning. Measured: every
-    # current OpenAI flagship (o4-mini, gpt-5-mini, gpt-5.1, gpt-5.4, gpt-5.6-sol,
-    # gpt-6-sol) rejects max_tokens outright.
-    # Name patterns rot as new families ship, so detect from the error and retry
-    # once rather than maintaining a model list.
-    $useCompletionTokens = $false
-    $attempt             = 0
-    $joined              = $null
-    $sw                  = $null
-
-    while ($attempt -lt 2) {
-        $attempt++
-
-        $payload = [ordered]@{
-            model    = $Deployment
-            messages = $Messages
-        }
-        if ($prof.Api -eq 'AnthropicMessages') {
-            # Anthropic requires max_tokens and has no alternate spelling.
-            $payload.max_tokens = $MaxTokens
-        }
-        elseif ($useCompletionTokens) {
-            $payload.max_completion_tokens = $MaxTokens
-        }
-        else {
-            $payload.max_tokens = $MaxTokens
-        }
-
-        if ($Stream) {
-            $payload.stream = $true
-            if ($prof.UsesStreamOptions) {
-                # THE INJECTION. Without this the usage block never arrives on
-                # the OpenAI-compatible path. Verified: stream:true alone returns none.
-                $payload.stream_options = @{ include_usage = $true }
-            }
-            # Deliberately NOT set for Anthropic: it returns HTTP 400
-            # "stream_options: Extra inputs are not permitted" and streams usage
-            # unconditionally anyway.
-        }
-
-        # GetTempPath() rather than $env:TEMP: TEMP is unset on Linux/macOS pwsh,
-        # so Join-Path would throw on a null path before any call was issued.
-        # utf8NoBOM rather than ascii: ascii replaces every non-ASCII codepoint
-        # with '?', silently mangling any non-English prompt before it reaches
-        # the model.
-        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("req-" + [guid]::NewGuid().ToString('N') + ".json")
-        ($payload | ConvertTo-Json -Depth 8 -Compress) | Set-Content $tmp -Encoding utf8NoBOM
-
-        $url   = $Endpoint.TrimEnd('/') + $prof.PathSuffix
-        $cargs = @('-s','-N','-X','POST',$url,
-                   '-H',"Authorization: Bearer $Token",
-                   '-H','Content-Type: application/json',
-                   '-d',"@$tmp")
-        foreach ($k in $prof.ExtraHeaders.Keys) {
-            $cargs += @('-H', ("{0}: {1}" -f $k, $prof.ExtraHeaders[$k]))
-        }
-
-        $sw  = [System.Diagnostics.Stopwatch]::StartNew()
-        try   { $raw = & curl.exe @cargs }
-        finally {
-            # finally, not a bare call after the invocation: with
-            # $ErrorActionPreference='Stop' a curl failure would skip the cleanup
-            # and leak the request body into TEMP on every failed call.
-            $sw.Stop()
-            Remove-Item $tmp -ErrorAction SilentlyContinue
-        }
-
-        $joined = $raw -join "`n"
-
-        # Adapt and retry once on the output-limit parameter mismatch.
-        # Both conditions are required. Matching the bare word anywhere in the
-        # body is not safe: a SUCCESSFUL completion whose text happens to discuss
-        # "max_completion_tokens" would match, discarding a response that was
-        # already charged upstream and billing only the retry. Requiring a
-        # genuine top-level error object avoids that - JSON escaping turns any
-        # model-authored quotes into \" so content cannot forge an error block.
-        if ($attempt -eq 1 -and -not $useCompletionTokens -and
-            $joined -match '"error"\s*:\s*\{' -and
-            $joined -match 'max_completion_tokens') {
-            Write-Verbose "'$Deployment' requires max_completion_tokens; retrying."
-            $useCompletionTokens = $true
-            continue
-        }
-        break
-    }
-
-    # Surface an API-level rejection instead of reporting it as "no usage".
-    # Calling Anthropic on the OpenAI path lands here, and the distinction
-    # between "the call failed" and "the call worked but had no usage" is the
-    # difference between a visible outage and a silent revenue leak.
-    if ($joined -match '"error"\s*:\s*\{') {
-        $msg  = ([regex]::Match($joined, '"message"\s*:\s*"([^"]{0,300})"')).Groups[1].Value
-        $code = ([regex]::Match($joined, '"(?:code|type)"\s*:\s*"([^"]{0,80})"')).Groups[1].Value
-        Write-Warning ("{0} call to '{1}' failed [{2}]: {3}" -f $prof.Provider, $Deployment, $code, $msg)
-        return $null
-    }
-
-    # Streaming returns SSE frames. On Anthropic usage appears twice -
-    # message_start (partial output_tokens) then message_delta (final) - so the
-    # LAST match is the authoritative one. Taking the first under-bills.
-    $usage = $null
-    $hits  = [regex]::Matches($joined, '"usage"\s*:\s*\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}')
-    if ($hits.Count -gt 0) {
-        $pick = if ($prof.UseLastUsageMatch) { $hits[$hits.Count - 1] } else { $hits[0] }
-        try { $usage = ("{" + $pick.Value + "}" | ConvertFrom-Json).usage } catch { }
-    }
-
-    if (-not $usage) {
-        # Two distinct causes, and they need different responses:
-        #
-        #  a) include_usage was not set on a streamed OpenAI-path call. That is
-        #     a code defect and under-bills every streamed request silently.
-        #
-        #  b) The response body came back EMPTY. Measured 2 occurrences in 60
-        #     rapid back-to-back streamed calls (~3%) on gpt-4.1-mini with
-        #     include_usage correctly set - a 2-byte body, no SSE frames, no
-        #     error JSON. The caller gets nothing either, so this surfaces as a
-        #     failed request rather than a silent under-bill, but the tokens may
-        #     still have been consumed upstream.
-        #
-        # In both cases: never record zero. Azure Monitor counts this traffic
-        # independently, so the reconciliation tier is what recovers it.
-        if ($Stream -and $prof.UsesStreamOptions) {
-            Write-Warning ("No usage block on streamed call to '{0}'. Either include_usage was dropped or the response body was empty. Do NOT bill zero - reconcile this window against Azure Monitor." -f $Deployment)
-        } else {
-            Write-Warning ("No usage block returned by {0} deployment '{1}'. Do NOT bill zero - reconcile against Azure Monitor." -f $prof.Provider, $Deployment)
-        }
-        return $null
-    }
-
-    $n = ConvertTo-NormalizedUsage -Usage $usage -ProviderProfile $prof
-
-    # CCU INVARIANT. Claude bills in Claude Consumption Units through Azure
-    # Marketplace as a single aggregate meter with no per-model dimension, so a
-    # per-model cost is not merely unknown - it does not exist. Compute it here
-    # and the inline meter would emit a fabricated number, contradicting the
-    # whole premise. Tokens stay exact; cost is null by design, and BillingModel
-    # says which kind of null this is so a caller can tell "impossible" from
-    # "missing price", exactly as Get-NearRealTimeCost does.
-    $cost         = $null
-    $billingModel = 'NoMeter'
-    $price        = if ($PriceTable) { $PriceTable[$Deployment] } else { $null }
-
-    if ($prof.CcuBilled) {
-        $billingModel = 'CCU'
-    }
-    elseif ($price) {
-        $billingModel = 'Derived'
-        # Cached input bills at the cached rate when the model exposes one.
-        # Anthropic additionally charges a PREMIUM for cache writes; when no
-        # explicit write rate is known, fall back to the standard input rate
-        # rather than treating the write as free.
-        # $null -ne, not truthiness: a genuine 0.0 rate (some tiers price cache
-        # reads at zero) is falsy in PowerShell and would silently fall back to
-        # the FULL input rate, overcharging the customer.
-        $cachedRate = if ($null -ne $price.CachedInputPer1M) { $price.CachedInputPer1M } else { $price.InputPer1M }
-        $writeRate  = if ($null -ne $price.CacheWritePer1M)  { $price.CacheWritePer1M }  else { $price.InputPer1M }
-        $cost = [math]::Round(
-            ($n.InputTokens      / 1000000 * $price.InputPer1M) +
-            ($n.CachedReadTokens / 1000000 * $cachedRate) +
-            ($n.CacheWriteTokens / 1000000 * $writeRate) +
-            ($n.OutputTokens     / 1000000 * $price.OutputPer1M), 8)
-    }
-
-    [pscustomobject]@{
-        Tenant        = $TenantTag
-        Provider      = $n.Provider
-        Deployment    = $Deployment
-        Streamed      = [bool]$Stream
-        InputTokens   = $n.InputTokens
-        CachedTokens  = $n.CachedReadTokens
-        CacheWrite    = $n.CacheWriteTokens
-        OutputTokens  = $n.OutputTokens
-        Reasoning     = $n.ReasoningTokens
-        TotalTokens   = $n.TotalTokens
-        CostUSD       = $cost
-        BillingModel  = $billingModel
-        PriceKnown    = [bool]$price
-        WallClockMs   = [int]$sw.ElapsedMilliseconds
-        # Per-request latency telemetry, free with the response - OpenAI only.
-        # Anthropic has no latency_checkpoint; these stay null and TTFT must be
-        # measured at the proxy instead.
-        TtftMs        = if ($prof.HasLatencyBlock) { $usage.latency_checkpoint.engine_ttft_ms } else { $null }
-        TbtMs         = if ($prof.HasLatencyBlock) { $usage.latency_checkpoint.engine_tbt_ms }  else { $null }
-        TtltMs        = if ($prof.HasLatencyBlock) { $usage.latency_checkpoint.engine_ttlt_ms } else { $null }
-    }
+function Format-Number($Value) {
+    # Money and rates as invariant text, for display only. PowerShell 7.6's
+    # Format-Table shows a double to 2 decimal places, so a $0.0375 rate
+    # prints as 0.04 and a whole small request as 0.00. Never round the value
+    # itself.
+    if ($null -eq $Value) { return 'n/a' }
+    ([double]$Value).ToString('0.########', [cultureinfo]::InvariantCulture)
 }
 
 # ---------------------------------------------------------------------------
-# 1. MODEL CATALOG  -  what models exist, which SKUs, lifecycle status
-#    Real time. This is the authoritative feed; there is no RSS or webhook.
+# 1. CATALOG AND DEPLOYMENTS  -  ARM, real time
+#    The catalog says what can be deployed in a region, with lifecycle and
+#    retirement dates; there is no RSS feed or webhook. The deployments say
+#    what is deployed, and from whom.
 # ---------------------------------------------------------------------------
 function Get-FoundryModelCatalog {
-    param($SubscriptionId, $Region, $Token)
+    param(
+        [Parameter(Mandatory)][string] $SubscriptionId,
+        [Parameter(Mandatory)][string] $Region,
+        [Parameter(Mandatory)][string] $Token,
+        [string] $Kind    # the account's kind ('AIServices', 'OpenAI'); omit for every kind
+    )
 
     $uri = "https://management.azure.com/subscriptions/$SubscriptionId" +
            "/providers/Microsoft.CognitiveServices/locations/$Region" +
-           "/models?api-version=2024-06-01-preview"
+           "/models?api-version=2024-10-01"
 
-    $resp = Invoke-ArmWithRetry -Uri $uri -Token $Token
-
-    # The API returns one entry per SKU AND per version, so collapse to one row
-    # per model name while UNIONING the SKUs. Keying on name alone and taking
-    # the first entry wholesale would under-report which SKUs a model supports.
+    # One entry per model version PER ACCOUNT KIND: eastus2 returned 338
+    # entries for 169 versions of 141 models (2026-10-07) - every version under
+    # 'AIServices', and again under 'OpenAI', 'MaaS' or 'MAI'. Filter to the
+    # account's kind, then collapse to one row per model name while UNIONING
+    # the SKUs and versions. Taking the first entry wholesale under-reports
+    # both.
     $byName = [ordered]@{}
-    foreach ($item in $resp.value) {
+    foreach ($item in (Get-ArmCollection -Uri $uri -Token $Token)) {
+        if ($Kind -and $item.kind -ne $Kind) { continue }
         $m = $item.model
+        if (-not $m.name) { continue }
         if (-not $byName.Contains($m.name)) {
             $byName[$m.name] = [pscustomobject]@{
-                Name       = $m.name
-                Version    = $m.version
-                Format     = $m.format
-                # GOTCHA: the ARM catalog's 'publisher' field is EMPTY on every
-                # entry (verified: 328/328 null in eastus2). The publisher key
-                # actually lives in 'format' - and its values ('OpenAI',
-                # 'OpenAI-OSS', 'DeepSeek', 'Mistral AI', ...) are exactly what
-                # Get-TokenPrice -Publisher expects. Reading 'publisher'
-                # directly yields a silent null, not an error.
-                Publisher  = if ($m.publisher) { $m.publisher } else { $m.format }
-                Lifecycle  = $m.lifecycleStatus
-                Skus       = [System.Collections.Generic.HashSet[string]]::new()
-                Versions   = [System.Collections.Generic.HashSet[string]]::new()
-                # usageName is the join key to quota; useful for capacity
-                # dashboards. Guarded: $null[0] throws, and with
-                # $ErrorActionPreference='Stop' one entry lacking a skus array
-                # would abort the whole catalog call.
-                UsageName  = if ($m.skus -and $m.skus.Count -gt 0) { $m.skus[0].usageName } else { $null }
+                Head      = $null
+                Skus      = [System.Collections.Generic.HashSet[string]]::new()
+                ByVersion = @{}
             }
         }
         $row = $byName[$m.name]
-        if ($m.version) { [void]$row.Versions.Add($m.version) }
-        foreach ($s in $m.skus) { if ($s.name) { [void]$row.Skus.Add($s.name) } }
+        # The head row describes the default version where there is one; 10
+        # of 141 models in eastus2 had none (2026-10-07).
+        if (-not $row.Head -or ($m.isDefaultVersion -and -not $row.Head.isDefaultVersion)) { $row.Head = $m }
+        foreach ($s in @($m.skus)) { if ($s.name) { [void]$row.Skus.Add($s.name) } }
+        if ($m.version) {
+            $row.ByVersion[[string]$m.version] = [pscustomobject]@{
+                Lifecycle           = $m.lifecycleStatus
+                InferenceRetirement = ConvertTo-DateText $m.deprecation.inference
+            }
+        }
     }
 
-    foreach ($row in $byName.Values) {
+    foreach ($name in $byName.Keys) {
+        $row = $byName[$name]
+        $h   = $row.Head
         [pscustomobject]@{
-            Name       = $row.Name
-            Version    = $row.Version
-            Versions   = (($row.Versions | Sort-Object) -join ',')
-            Format     = $row.Format
-            Publisher  = $row.Publisher
-            Lifecycle  = $row.Lifecycle
-            Skus       = (($row.Skus | Sort-Object) -join ',')
-            UsageName  = $row.UsageName
+            Name                = $name
+            Version             = $h.version
+            HasDefault          = [bool]$h.isDefaultVersion
+            Versions            = (@($row.ByVersion.Keys | Sort-Object) -join ',')
+            Format              = $h.format
+            # GOTCHA: the publisher key is 'format', not 'publisher'. format is
+            # on every entry and equals the deployment's properties.model.format
+            # ('OpenAI', 'OpenAI-OSS', 'Anthropic', 'xAI', 'DeepSeek',
+            # 'Mistral AI', ...), the value Get-TokenPrice -Publisher expects.
+            # 'publisher' is absent on every OpenAI-format entry and present on
+            # every other one - 182 of 338 in eastus2 (2026-10-07), which is
+            # exactly the 156 OpenAI entries missing it. For gpt-oss it says
+            # 'OpenAI' where format says 'OpenAI-OSS'.
+            Publisher           = $h.format
+            Lifecycle           = $h.lifecycleStatus
+            InferenceRetirement = ConvertTo-DateText $h.deprecation.inference
+            Skus                = (@($row.Skus | Sort-Object) -join ',')
+            # usageName is the join key to quota; useful for capacity
+            # dashboards. Guarded: $null[0] throws, and with
+            # $ErrorActionPreference='Stop' one entry lacking a skus array
+            # would abort the whole catalog call.
+            UsageName           = if ($h.skus -and @($h.skus).Count -gt 0) { @($h.skus)[0].usageName } else { $null }
+            ByVersion           = $row.ByVersion
+        }
+    }
+}
+
+# DEPLOYMENT -> PUBLISHER  -  the join inline metering depends on
+#
+#   You cannot infer the publisher from a deployment name: operators rename
+#   deployments freely, and 'my-fast-model' says nothing about who built it.
+#   properties.model.format on the ARM deployment is the authoritative key,
+#   and it is what Get-ProviderProfile and Get-TokenPrice both expect.
+#   Guessing wrong here sends Claude traffic to the OpenAI path, which fails
+#   the call outright.
+function Get-FoundryDeployments {
+    param(
+        [Parameter(Mandatory)][string] $AccountResourceId,
+        [Parameter(Mandatory)][string] $Token
+    )
+    $uri = "https://management.azure.com$AccountResourceId/deployments?api-version=2024-10-01"
+    foreach ($d in (Get-ArmCollection -Uri $uri -Token $Token)) {
+        [pscustomobject]@{
+            Deployment = $d.name
+            Model      = $d.properties.model.name
+            Publisher  = $d.properties.model.format
+            Version    = $d.properties.model.version
+            Sku        = $d.sku.name
+            Capacity   = $d.sku.capacity
+            State      = $d.properties.provisioningState
         }
     }
 }
 
 # ---------------------------------------------------------------------------
 # 2. UNIT PRICING  -  Azure Retail Prices API
-#    Anonymous, no subscription context. Prices change rarely: cache daily.
+#    Anonymous, no subscription context. LIST prices: no EA, MACC or
+#    negotiated discount. Prices change rarely: cache daily.
+#    Build-FoundryPriceTable.ps1 builds and caches the per-token table; this
+#    section turns it into per-deployment rates.
 #
 #    GOTCHAS (every one of these was hit in practice):
 #
@@ -583,34 +393,45 @@ function Get-FoundryModelCatalog {
 #        value now returns ZERO rows silently - an HTTP 200 with Count=0, not
 #        an error. Any query still using it will look like "no pricing exists".
 #
+#      * The model-router fee is not under 'Foundry Models'. It is
+#        'Model Routers GL 1M Tokens' (DZ for Data Zone) under serviceName
+#        'Foundry Tools'.
+#
 #      * unitOfMeasure is MIXED within the same service - both '1K' and '1M'
-#        appear. You must normalise per row. Blindly multiplying retailPrice
-#        by 1e6 overstates 1K-denominated meters by 1000x.
+#        appear. You must normalise per row: reading every row as per 1M
+#        understates the 1K meters 1000x, and reading every row as per 1K
+#        overstates the 1M meters 1000x.
 #
 #      * productName spelling is inconsistent. 'Azure Deepseek Models' has a
-#        lowercase 's' - contains(productName,'DeepSeek') returns zero rows.
+#        lowercase 's' - a case-sensitive match on 'DeepSeek' misses it.
 #
-#      * meterName uses abbreviations, not model IDs: 'Inp'/'Outp' for
-#        input/output, 'glbl' for Global Standard, 'DZone' for Data Zone.
-#        Searching for 'gpt-4.1' will not match 'gpt 4.1 Inp glbl Tokens'.
+#      * meterName uses abbreviations, not model IDs - and not consistently.
+#        Input: 'Inp', 'Inpt', 'Input'. Output: 'Outp', 'outpt', 'Opt',
+#        'Output'. Cached: 'cd', 'cchd', 'Cached', 'Cache'. Global: 'glbl',
+#        'Gl', 'global'. Data Zone: 'DZ', 'DZone', 'Data Zone', 'datazone'.
+#        Regional: 'regnl', 'rgnl', 'regional'. Searching for 'gpt-4.1' will
+#        not match 'gpt 4.1 Inp glbl Tokens'.
 #
-#      * Format-Table rounds to 2dp. Normalise BEFORE formatting or per-token
-#        prices all render as 0.00 and the catalog looks free.
+#      * PowerShell 7.6's Format-Table shows doubles to 2 decimal places, so
+#        per-token prices render as 0.00 and the catalog looks free. Format
+#        rates as text before display (Format-Number).
 #
 #      * Paginated via NextPageLink and throttled - handle both.
 # ---------------------------------------------------------------------------
 function Get-AzureRetailPrices {
-    param([string] $Filter)
+    param([Parameter(Mandatory)][string] $Filter)
 
-    $uri  = "https://prices.azure.com/api/retail/prices?`$filter=" + [uri]::EscapeDataString($Filter)
-    $all  = @()
+    # Pin the API version so the response shape cannot change under this
+    # parser without a code change. NextPageLink carries it to later pages.
+    $uri  = "https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview&`$filter=" + [uri]::EscapeDataString($Filter)
+    $all  = [System.Collections.Generic.List[object]]::new()
     $next = $uri
     $fail = 0
 
     while ($next) {
         try {
-            $page = Invoke-RestMethod -Uri $next -ErrorAction Stop
-            $all += $page.Items
+            $page = Invoke-RestMethod -Uri $next -TimeoutSec 60 -ErrorAction Stop
+            foreach ($i in @($page.Items)) { $all.Add($i) }
             $next = $page.NextPageLink
             $fail = 0
         }
@@ -636,6 +457,8 @@ function Get-AzureRetailPrices {
             ProductName   = $item.productName
             MeterName     = $item.meterName
             SkuName       = $item.skuName
+            ServiceName   = $item.serviceName
+            Type          = $item.type
             Region        = $item.armRegionName
             UnitOfMeasure = $item.unitOfMeasure
             RetailPrice   = $item.retailPrice
@@ -644,414 +467,1279 @@ function Get-AzureRetailPrices {
     }
 }
 
-# ---------------------------------------------------------------------------
-# 2b. DEPLOYMENT -> PUBLISHER  -  the join inline metering depends on
-#
-#     You cannot infer the publisher from a deployment name: operators rename
-#     deployments freely, and 'my-fast-model' says nothing about who built it.
-#     properties.model.format on the ARM deployment is the authoritative key,
-#     and it is what Get-ProviderProfile and Get-TokenPrice both expect.
-#     Guessing wrong here sends Claude traffic to the OpenAI endpoint, which
-#     fails the call outright.
-# ---------------------------------------------------------------------------
-function Get-FoundryDeployments {
-    param($AccountName, $ResourceGroup)
+function Resolve-ModelPrice {
+    <#
+      Resolves one deployed model to the rates inline metering and the
+      near-real-time join need - input, output, cached input and cache write -
+      at each service tier that has meters. BillingModel says why a cost may
+      be null:
 
-    $json = az cognitiveservices account deployment list `
-                -n $AccountName -g $ResourceGroup -o json 2>$null
-    if (-not $json) { return @() }
+        Derived      list prices from the Retail Prices API
+        Router       model-router: a router fee plus the routed model's rates,
+                     resolved per request (Get-RoutedPrice)
+        Marketplace  Anthropic: billed through Azure Marketplace, not here
+        Capacity     provisioned throughput: billed per hour, not per token
+        NoMeter      no usable list price; Note says why
 
-    foreach ($d in ($json | ConvertFrom-Json)) {
-        [pscustomobject]@{
-            Deployment = $d.name
-            Model      = $d.properties.model.name
-            Publisher  = $d.properties.model.format
-            Version    = $d.properties.model.version
-            Sku        = $d.sku.name
+      Service tiers are 'default', 'priority' and 'flex', keyed as the
+      response's service_tier reports them. Models priced only in Short and
+      Long context bands (gpt-5.5 and later) are resolved at Short; a request
+      past the long-context threshold bills at the Long rates.
+    #>
+    param(
+        [Parameter(Mandatory)] $Table,
+        [Parameter(Mandatory)][string] $ModelName,
+        [string] $Publisher,
+        [string] $Sku = 'GlobalStandard',
+        [string] $Version,
+        $RouterMeters,                        # Get-AzureRetailPrices rows for 'Model Routers'
+        [hashtable] $PublisherOf = @{}        # model name -> publisher, for routed models
+    )
+
+    $entry = [pscustomobject]@{
+        Model        = $ModelName
+        Publisher    = $Publisher
+        Sku          = $Sku
+        BillingModel = 'NoMeter'
+        Note         = $null
+        Tiers        = @{}
+        RouterPer1M  = $null
+        RouterMeter  = $null
+        Routed       = @{}
+        Table        = $Table
+        PublisherOf  = $PublisherOf
+    }
+
+    if ($ModelName -eq 'model-router') {
+        # Every request bills a router fee on its input tokens, plus the
+        # routed model's own meters. The fee meter follows the deployment
+        # type: 'GL' for Global, 'DZ' for Data Zone.
+        $entry.BillingModel = 'Router'
+        $like = if ($Sku -match 'DataZone') { '* DZ *' } elseif ($Sku -match 'Global') { '* GL *' } else { $null }
+        $fee  = if ($like) {
+            @($RouterMeters | Where-Object { $_.Type -eq 'Consumption' -and $null -ne $_.PricePer1M -and $_.MeterName -like $like })[0]
         }
+        if ($fee) { $entry.RouterPer1M = $fee.PricePer1M; $entry.RouterMeter = $fee.MeterName }
+        else      { $entry.Note = "No router-fee meter for SKU '$Sku' in the Retail Prices API, so router costs are not computed." }
+        return $entry
+    }
+
+    $q = @{ Table = $Table; ModelName = $ModelName; Publisher = $Publisher; Sku = $Sku; WarningAction = 'SilentlyContinue' }
+    if ($Version) { $q.ModelVersion = $Version }
+
+    $probe = Get-TokenPrice @q -Kind Input
+    if ($probe.Status -eq 'BilledOutsideRetailAPI') { $entry.BillingModel = 'Marketplace'; $entry.Note = $probe.Note; return $entry }
+    if ($probe.Status -eq 'BilledAsCapacity')       { $entry.BillingModel = 'Capacity';    $entry.Note = $probe.Note; return $entry }
+
+    foreach ($tier in 'default', 'priority', 'flex') {
+        # Priority and Flex have their own meters; their ratio to Standard
+        # varies by model, so read each tier's meter rather than scaling.
+        $tq = @{}
+        if ($tier -eq 'priority') { $tq.ServiceTier = 'Priority' }
+        if ($tier -eq 'flex')     { $tq.ServiceTier = 'Flex' }
+        foreach ($ct in 'Standard', 'Short') {
+            $in = Get-TokenPrice @q @tq -Kind Input -ContextTier $ct
+            if ($in.Status -ne 'Priced') { continue }
+            $out = Get-TokenPrice @q @tq -Kind Output      -ContextTier $ct
+            $cin = Get-TokenPrice @q @tq -Kind CachedInput -ContextTier $ct
+            $cw  = Get-TokenPrice @q @tq -Kind CacheWrite  -ContextTier $ct
+            $entry.Tiers[$tier] = [pscustomobject]@{
+                ContextTier      = $ct
+                InputPer1M       = $in.PricePer1M
+                InputMeter       = $in.MeterName
+                OutputPer1M      = if ($out.Status -eq 'Priced') { $out.PricePer1M } else { $null }
+                OutputMeter      = if ($out.Status -eq 'Priced') { $out.MeterName }  else { $null }
+                CachedInputPer1M = if ($cin.Status -eq 'Priced') { $cin.PricePer1M } else { $null }
+                CacheWritePer1M  = if ($cw.Status  -eq 'Priced') { $cw.PricePer1M }  else { $null }
+            }
+            break
+        }
+    }
+
+    if ($entry.Tiers.ContainsKey('default')) { $entry.BillingModel = 'Derived' }
+    else { $entry.Note = "[$($probe.Status)] $($probe.Note)" }
+    $entry
+}
+
+function Get-RoutedPrice {
+    # Rates for the model a model-router request was routed to, cached on the
+    # router's entry. The response names it with its version appended
+    # ('gpt-5.4-nano-2026-03-17'); Monitor gives name and version separately.
+    param(
+        [Parameter(Mandatory)] $RouterEntry,
+        [Parameter(Mandatory)][string] $ModelName,
+        [string] $Version
+    )
+    $m = $ModelName
+    $v = $Version
+    if (-not $v -and $ModelName -match '^(.+)-(\d{4}-\d{2}-\d{2})$') { $m = $Matches[1]; $v = $Matches[2] }
+    $key = "$m|$v"
+    if (-not $RouterEntry.Routed.ContainsKey($key)) {
+        $RouterEntry.Routed[$key] = Resolve-ModelPrice -Table $RouterEntry.Table -ModelName $m `
+            -Publisher $RouterEntry.PublisherOf[$m] -Sku $RouterEntry.Sku -Version $v
+    }
+    $RouterEntry.Routed[$key]
+}
+
+function Measure-TokenCost {
+    <#
+      USD cost of a token count at one tier's rates, or a $null Cost - never
+      0 - when a rate it needs is missing. -InputTokens is the UNCACHED
+      remainder: prompt - cached - cache write on the OpenAI path, input_tokens
+      on Anthropic. Decimal arithmetic, rounded to 8 places.
+    #>
+    param(
+        $Rates,
+        [long] $InputTokens      = 0,
+        [long] $CachedTokens     = 0,
+        [long] $CacheWriteTokens = 0,
+        [long] $OutputTokens     = 0
+    )
+    function New-Cost($cost, $note) { [pscustomobject]@{ Cost = $cost; Note = $note } }
+
+    if ($InputTokens -lt 0 -or $CachedTokens -lt 0 -or $CacheWriteTokens -lt 0 -or $OutputTokens -lt 0) {
+        return New-Cost $null 'Negative token count: the usage block is inconsistent. No cost claimed.'
+    }
+    if (-not $Rates -or $null -eq $Rates.InputPer1M) { return New-Cost $null 'No input rate.' }
+
+    $note = $null
+    [decimal] $sum = 0
+    if ($InputTokens -gt 0) { $sum += [decimal]$InputTokens * [decimal]$Rates.InputPer1M }
+    if ($CachedTokens -gt 0) {
+        if ($null -ne $Rates.CachedInputPer1M) { $sum += [decimal]$CachedTokens * [decimal]$Rates.CachedInputPer1M }
+        else {
+            $sum += [decimal]$CachedTokens * [decimal]$Rates.InputPer1M
+            $note = 'No cached-input rate: cached tokens priced at the input rate, so this is an upper bound.'
+        }
+    }
+    if ($CacheWriteTokens -gt 0) {
+        # Cache writes bill ABOVE the input rate (1.25x on gpt-5.6 and gpt-6),
+        # so no fallback rate would be safe.
+        if ($null -eq $Rates.CacheWritePer1M) { return New-Cost $null 'Cache-write tokens but no cache-write rate. No cost claimed.' }
+        $sum += [decimal]$CacheWriteTokens * [decimal]$Rates.CacheWritePer1M
+    }
+    if ($OutputTokens -gt 0) {
+        if ($null -eq $Rates.OutputPer1M) { return New-Cost $null 'Output tokens but no output rate. No cost claimed.' }
+        $sum += [decimal]$OutputTokens * [decimal]$Rates.OutputPer1M
+    }
+    New-Cost ([double][math]::Round($sum / 1000000, 8)) $note
+}
+
+# ---------------------------------------------------------------------------
+# 3. INLINE METERING  -  read usage straight off the inference response
+#
+#    The only per-request, per-tenant source: Monitor has no tenant dimension
+#    (key point #2). Meter inline for attribution; use Monitor for totals and
+#    to catch traffic that bypassed the gateway.
+#
+#    *** INLINE METERING IS PROVIDER-SHAPED. *** Verified live, Oct 2026:
+#
+#    ENDPOINT
+#      OpenAI / xAI / DeepSeek -> /openai/v1/chat/completions
+#      Anthropic               -> /anthropic/v1/messages   + anthropic-version
+#      All three account hosts (<account>.services.ai.azure.com,
+#      .openai.azure.com and .cognitiveservices.azure.com) route both paths.
+#      Claude on the OpenAI path is HTTP 404 api_not_supported; omitting
+#      anthropic-version is HTTP 400.
+#
+#    FIELD NAMES
+#      OpenAI path -> prompt_tokens / completion_tokens / total_tokens
+#      Anthropic   -> input_tokens  / output_tokens      (no total)
+#      A parser reading prompt_tokens off Anthropic records 0, not an error.
+#
+#    CACHE - THE ASYMMETRY THAT BREAKS COST MATH
+#      OpenAI path  prompt_tokens INCLUDES prompt_tokens_details.cached_tokens
+#                   and, where reported (gpt-5.6, gpt-6, model-router),
+#                   prompt_tokens_details.cache_write_tokens
+#                   -> uncached input = prompt - cached - cache_write
+#      Anthropic    input_tokens EXCLUDES cache_read_input_tokens and
+#                   cache_creation_input_tokens, which are siblings
+#                   -> uncached input = input_tokens   (no subtraction)
+#      Subtracting on Anthropic double-discounts. Not subtracting on the
+#      OpenAI path bills cached tokens twice.
+#
+#    REASONING
+#      o4-mini   prompt 15, completion 174, reasoning 128, total 189:
+#                reasoning is INSIDE completion_tokens (15 + 174 = 189).
+#      grok-4.3  prompt 18, completion 1, reasoning 691, total 710:
+#                reasoning is OUTSIDE completion_tokens (18 + 1 + 691 = 710).
+#                Azure billed completion_tokens alone: grok-4.3's billed output
+#                equalled Monitor's OutputTokens exactly, with the reasoning
+#                unbilled (Cost Management, Oct 2026). Microsoft's Grok
+#                documentation says completion tokens include reasoning, so
+#                detect the convention from the totals on every response and
+#                check it against your own bill.
+#
+#    STREAMING
+#      OpenAI models send usage only when stream_options.include_usage is
+#      true; xAI and DeepSeek send it regardless. Anthropic always streams
+#      usage and REJECTS stream_options (HTTP 400), so never inject it there.
+#      Take the LAST usage object: Anthropic's message_start carries a partial
+#      output count and message_delta the final one - but only message_start
+#      splits cache writes into 5-minute and 1-hour. A complete stream ends
+#      with 'data: [DONE]' (OpenAI path) or 'event: message_stop' (Anthropic).
+#
+#    OUTPUT LIMIT
+#      max_completion_tokens was accepted by all 14 OpenAI-path deployments
+#      tested (OpenAI models, grok-4.3, DeepSeek-V4.1-Flash, model-router).
+#      max_tokens was rejected with HTTP 400 by 8 of them: o4-mini, gpt-5-mini,
+#      gpt-5.1, gpt-5.4, gpt-5.4-mini, gpt-5.6-sol, gpt-6-sol, gpt-6-astra.
+#      Anthropic takes max_tokens only. On grok-4.3 neither capped reasoning.
+#
+#    FAILURE
+#      Judge failure by the HTTP status. A 200 can carry an error object: a
+#      gpt-4.1 completion returned HTTP 200, finish_reason 'stop' and a full
+#      usage block, with prompt_filter_results[0].content_filter_results
+#      .defender_for_ai.details.error = {"code":"408","message":"DefenderForAI
+#      request exceeded 300ms timeout."}. Searching the body for "error":{
+#      would have discarded a billed response.
+#
+#    REQUEST ID
+#      The apim-request-id response header equals CorrelationId in the
+#      AzureOpenAIRequestUsage log for OpenAI models (not for model-router).
+#      Record it to join a request to the diagnostic logs.
+#
+#    SERVICE TIER
+#      Priority and Flex are chosen per request and bill on their own meters:
+#      Priority at 2x Standard on most models (1.75x on gpt-4.1 and
+#      gpt-4.1-mini, 1.8x on gpt-5-mini, 2.5x on gpt-5.5), Flex at 0.5x where
+#      a Flex meter exists. Only the response's service_tier is authoritative:
+#      gpt-4.1-mini answered 'default' to a priority request, and an
+#      unsupported flex request is HTTP 400. grok-4.3 omits service_tier on
+#      non-streamed responses; Claude reports 'standard'.
+#
+#    LATENCY
+#      OpenAI models return a latency_checkpoint block (engine_ttft_ms,
+#      service_ttft_ms, ...): inside usage on a non-streamed response, at the
+#      top level of a streamed chunk. Engine and service TTFT differ - 64 vs
+#      518 ms on one request. Anthropic returns none. A buffered client (as
+#      here) cannot see TTFT itself, so measure it at the proxy as well.
+# ---------------------------------------------------------------------------
+
+function Get-ProviderProfile {
+    <#
+      Maps a publisher to what differs about calling and metering it. The
+      publisher is the deployment's properties.model.format. Only Anthropic
+      needs a profile of its own: xAI and DeepSeek use the OpenAI-compatible
+      path and field names, and where they differ (reasoning outside
+      completion_tokens, no prompt_tokens_details) ConvertTo-NormalizedUsage
+      detects it from the numbers, not from the publisher name.
+    #>
+    param([Parameter(Mandatory)][string] $Publisher)
+
+    if ($Publisher -eq 'Anthropic') {
+        return [pscustomobject]@{
+            Provider           = 'Anthropic'
+            Api                = 'AnthropicMessages'
+            PathSuffix         = '/anthropic/v1/messages'
+            ExtraHeaders       = @{ 'anthropic-version' = '2023-06-01' }
+            UsesStreamOptions  = $false    # streams usage anyway; 400s on stream_options
+            InputIncludesCache = $false
+            HasTotalTokens     = $false
+            MarketplaceBilled  = $true
+        }
+    }
+    [pscustomobject]@{
+        Provider           = $Publisher
+        Api                = 'OpenAIChatCompletions'
+        PathSuffix         = '/openai/v1/chat/completions'
+        ExtraHeaders       = @{}
+        UsesStreamOptions  = $true
+        InputIncludesCache = $true
+        HasTotalTokens     = $true
+        MarketplaceBilled  = $false
+    }
+}
+
+function ConvertTo-NormalizedUsage {
+    <#
+      Collapses every publisher's usage block into one schema:
+
+        InputTokens        uncached input, cache reads and writes removed
+        CachedReadTokens   input served from cache (cached-input rate)
+        CacheWriteTokens   input written to cache (cache-write rate)
+        CacheWrite5m/1h    Anthropic's split of CacheWriteTokens, if reported
+        OutputTokens       completion_tokens / output_tokens as reported
+        ReasoningTokens    as reported
+        ReasoningInOutput  $true  - reasoning is inside OutputTokens (o-series)
+                           $false - reasoning is outside it (grok-4.3); it is
+                                    not in OutputTokens or TotalTokens
+                           $null  - no reasoning reported
+        TotalTokens        Input + CachedRead + CacheWrite + Output: the
+                           tokens a price applies to
+        ReportedTotal      the provider's own total_tokens, if any
+
+      [long] throughout: a long-context prompt is fine in [int], but these
+      counts get summed, and a day's total for one deployment can pass the
+      2.1 billion an [int] holds.
+    #>
+    param(
+        [Parameter(Mandatory)] $Usage,
+        [Parameter(Mandatory)] $ProviderProfile
+    )
+
+    $reason = [long]0; $reasonInOut = $null; $reported = $null
+    $w5m = $null; $w1h = $null
+
+    if ($ProviderProfile.Api -eq 'AnthropicMessages') {
+        # input_tokens EXCLUDES cache reads and writes - do not subtract.
+        $inTok   = [long]$Usage.input_tokens
+        $cacheRd = [long]$Usage.cache_read_input_tokens
+        $cacheWr = [long]$Usage.cache_creation_input_tokens
+        $outTok  = [long]$Usage.output_tokens
+        if ($Usage.cache_creation) {
+            $w5m = [long]$Usage.cache_creation.ephemeral_5m_input_tokens
+            $w1h = [long]$Usage.cache_creation.ephemeral_1h_input_tokens
+        }
+    }
+    else {
+        # prompt_tokens INCLUDES cache reads and writes - subtract both.
+        # DeepSeek has no prompt_tokens_details; [long]$null is 0, which is right.
+        $prompt  = [long]$Usage.prompt_tokens
+        $cacheRd = [long]$Usage.prompt_tokens_details.cached_tokens
+        $cacheWr = [long]$Usage.prompt_tokens_details.cache_write_tokens
+        $inTok   = $prompt - $cacheRd - $cacheWr
+        $outTok  = [long]$Usage.completion_tokens
+        $reason  = [long]$Usage.completion_tokens_details.reasoning_tokens
+        if ($null -ne $Usage.total_tokens) { $reported = [long]$Usage.total_tokens }
+
+        # Which side of completion_tokens is reasoning on? Decide from the
+        # provider's own total rather than a publisher list. A total that fits
+        # neither reading means the accounting changed - surface it loudly
+        # rather than ship a quietly wrong invoice.
+        if ($null -ne $reported) {
+            if ($reported -eq $prompt + $outTok) {
+                if ($reason -gt 0) { $reasonInOut = $true }
+            }
+            elseif ($reason -gt 0 -and $reported -eq $prompt + $outTok + $reason) {
+                $reasonInOut = $false
+            }
+            else {
+                Write-Warning ("Usage mismatch for {0}: total_tokens {1} is neither prompt + completion ({2}) nor that plus reasoning ({3}). Token accounting for this publisher may have changed." -f `
+                    $ProviderProfile.Provider, $reported, ($prompt + $outTok), ($prompt + $outTok + $reason))
+            }
+        }
+    }
+
+    [pscustomobject]@{
+        Provider          = $ProviderProfile.Provider
+        InputTokens       = $inTok
+        CachedReadTokens  = $cacheRd
+        CacheWriteTokens  = $cacheWr
+        CacheWrite5m      = $w5m
+        CacheWrite1h      = $w1h
+        OutputTokens      = $outTok
+        ReasoningTokens   = $reason
+        ReasoningInOutput = $reasonInOut
+        TotalTokens       = $inTok + $cacheRd + $cacheWr + $outTok
+        ReportedTotal     = $reported
+    }
+}
+
+function Invoke-MeteredCompletion {
+    <#
+      Provider-aware metering wrapper. Picks the path, headers and payload
+      shape for the publisher, sends one request, and returns exact token
+      counts, the service tier the request ran at and its list-price cost -
+      or nothing, with a warning, when the call failed or carried no usage.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Endpoint,    # the account's 'AI Foundry API' endpoint
+        [Parameter(Mandatory)][string] $Deployment,
+        [Parameter(Mandatory)] $Messages,
+        [Parameter(Mandatory)][string] $Publisher,   # from the ARM deployment: properties.model.format
+        $PriceEntry,                                 # from Resolve-ModelPrice
+        [int] $MaxTokens = 256,
+        [switch] $Stream,
+        [ValidateSet('auto', 'default', 'priority', 'flex')][string] $ServiceTier,
+        [int] $TimeoutSec = 120,
+        [string] $Token,
+        [string] $TenantTag = 'default'              # your own tenant / user attribution
+    )
+
+    $prof = Get-ProviderProfile -Publisher $Publisher
+    if (-not $Token) { $Token = Get-EntraToken -Resource 'https://cognitiveservices.azure.com' }
+
+    $headers = @{ Authorization = "Bearer $Token" }
+    foreach ($k in $prof.ExtraHeaders.Keys) { $headers[$k] = $prof.ExtraHeaders[$k] }
+    $url = $Endpoint.TrimEnd('/') + $prof.PathSuffix
+
+    # max_completion_tokens on the OpenAI path: every deployment tested took
+    # it, and the reasoning models reject max_tokens. A publisher that wants
+    # max_tokens instead gets one retry - on an HTTP 400, so no charged
+    # response is ever discarded. Anthropic takes max_tokens only.
+    $limitParam = if ($prof.Api -eq 'AnthropicMessages') { 'max_tokens' } else { 'max_completion_tokens' }
+    $resp = $null; $status = 0; $body = ''; $sw = $null
+
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $payload = [ordered]@{ model = $Deployment; messages = $Messages }
+        $payload[$limitParam] = $MaxTokens
+        if ($Stream) {
+            $payload.stream = $true
+            if ($prof.UsesStreamOptions) {
+                # Without this, OpenAI models stream no usage at all.
+                $payload.stream_options = @{ include_usage = $true }
+            }
+        }
+        if ($ServiceTier) {
+            if ($prof.Api -eq 'AnthropicMessages') { Write-Warning "service_tier is not sent to Anthropic; '$Deployment' runs at its default tier." }
+            else { $payload.service_tier = $ServiceTier }
+        }
+        # UTF-8 bytes, so a non-English prompt reaches the model intact.
+        $bytes = [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Depth 10 -Compress))
+
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $resp = Invoke-WebRequest -Uri $url -Method Post -Headers $headers -Body $bytes `
+                        -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec $TimeoutSec
+        }
+        catch {
+            Write-Warning ("{0} call to '{1}' got no response: {2} Tokens may still have been consumed - reconcile against Azure Monitor." -f `
+                $prof.Provider, $Deployment, $_.Exception.Message)
+            return
+        }
+        finally { $sw.Stop() }
+
+        $status = [int]$resp.StatusCode
+        $body   = [Text.Encoding]::UTF8.GetString($resp.RawContentStream.ToArray())
+        if ($attempt -eq 1 -and $status -eq 400 -and $limitParam -eq 'max_completion_tokens' -and
+            $body -match 'max_completion_tokens' -and $body -match '(?i)unsupported|not supported|unrecognized|unknown') {
+            Write-Verbose "'$Deployment' rejected max_completion_tokens; retrying with max_tokens."
+            $limitParam = 'max_tokens'
+            continue
+        }
+        break
+    }
+
+    $requestId = $null
+    foreach ($k in $resp.Headers.Keys) { if ($k -ieq 'apim-request-id') { $requestId = @($resp.Headers[$k])[0] } }
+
+    # Judge failure by the HTTP status ONLY. A 200 can carry a nested error
+    # object (Defender for AI's 408 timeout, above) on a response that was
+    # served and billed. Surface a real rejection instead of reporting it as
+    # "no usage": the difference between a visible outage and a silent
+    # revenue leak.
+    if ($status -lt 200 -or $status -ge 300) {
+        $code = $null; $msg = $null
+        try {
+            $e    = ($body | ConvertFrom-Json -ErrorAction Stop).error
+            $code = if ($e.code) { $e.code } else { $e.type }
+            $msg  = $e.message
+        } catch { }
+        if (-not $msg) {
+            $msg = $body -replace '\s+', ' '
+            if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 300) }
+        }
+        Write-Warning ("{0} call to '{1}' failed: HTTP {2} [{3}] {4} (apim-request-id {5})" -f `
+            $prof.Provider, $Deployment, $status, $code, $msg, $requestId)
+        return
+    }
+
+    # Usage objects nest at most two levels ('prompt_tokens_details',
+    # 'cache_creation'). JSON escaping turns any model-authored quotes into
+    # \" so generated text cannot forge a "usage" key. Take the LAST match:
+    # streams repeat or update usage, and the final object is complete.
+    $usage = $null
+    $hits  = [regex]::Matches($body, '"usage"\s*:\s*\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}')
+    if ($hits.Count -gt 0) {
+        try { $usage = ('{' + $hits[$hits.Count - 1].Value + '}' | ConvertFrom-Json).usage } catch { }
+        if ($usage -and $hits.Count -gt 1 -and $prof.Api -eq 'AnthropicMessages') {
+            # Fields only message_start carries (the 5m / 1h cache split)
+            # are filled from the first usage object.
+            try {
+                $first = ('{' + $hits[0].Value + '}' | ConvertFrom-Json).usage
+                foreach ($p in $first.PSObject.Properties) {
+                    $cur = $usage.PSObject.Properties[$p.Name]
+                    if (-not $cur -or $null -eq $cur.Value) {
+                        $usage | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force
+                    }
+                }
+            } catch { }
+        }
+    }
+
+    if (-not $usage) {
+        # Two distinct causes, and they need different responses:
+        #
+        #  a) include_usage was not set on a streamed OpenAI-path call. That is
+        #     a code defect and under-bills every streamed request silently.
+        #
+        #  b) The response body came back EMPTY - no SSE frames, no error JSON.
+        #     Seen once during development; NOT reproducible. 120 back-to-back
+        #     streamed gpt-4.1-mini calls with include_usage set (60 with no
+        #     pause, 60 at 150 ms apart, 2026-10-07) all returned a usage block:
+        #     0 empty bodies. Treat it as rare rather than as a rate. The caller
+        #     gets nothing either, so it surfaces as a failed request rather
+        #     than a silent under-bill, but the tokens may still have been
+        #     consumed upstream.
+        #
+        # In both cases: never record zero. Azure Monitor counts this traffic
+        # independently, so the reconciliation tier is what recovers it.
+        if ($Stream -and $prof.UsesStreamOptions) {
+            Write-Warning ("No usage block on streamed call to '{0}' (apim-request-id {1}). Either include_usage was dropped or the response body was empty. Do NOT bill zero - reconcile this window against Azure Monitor." -f $Deployment, $requestId)
+        } else {
+            Write-Warning ("No usage block returned by {0} deployment '{1}' (apim-request-id {2}). Do NOT bill zero - reconcile against Azure Monitor." -f $prof.Provider, $Deployment, $requestId)
+        }
+        return
+    }
+
+    $n = ConvertTo-NormalizedUsage -Usage $usage -ProviderProfile $prof
+
+    $tierHits = [regex]::Matches($body, '"service_tier"\s*:\s*"([^"]+)"')
+    $tierRaw  = if ($tierHits.Count -gt 0) { $tierHits[$tierHits.Count - 1].Groups[1].Value.ToLowerInvariant() } else { $null }
+    $tierKey  = if ($tierRaw -in 'priority', 'flex') { $tierRaw } else { 'default' }
+
+    $latency = $null
+    $latHits = [regex]::Matches($body, '"latency_checkpoint"\s*:\s*\{[^{}]*\}')
+    if ($latHits.Count -gt 0) {
+        try { $latency = ('{' + $latHits[$latHits.Count - 1].Value + '}' | ConvertFrom-Json).latency_checkpoint } catch { }
+    }
+
+    # The model that served the request, versioned ('gpt-4.1-2025-04-14').
+    # For model-router it is the routed model, which decides the price.
+    $modelHits = [regex]::Matches($body, '"model"\s*:\s*"([^"]+)"')
+    $served    = if ($modelHits.Count -gt 0) { $modelHits[$modelHits.Count - 1].Groups[1].Value } else { $null }
+
+    $complete = $null
+    if ($Stream) {
+        $complete = ($body -match '(?m)^data:\s*\[DONE\]') -or ($body -match '(?m)^event:\s*message_stop')
+        if (-not $complete) {
+            Write-Warning ("Stream from '{0}' ended without its terminator (apim-request-id {1}); the usage may be partial - reconcile against Azure Monitor." -f $Deployment, $requestId)
+        }
+    }
+
+    $notes = [System.Collections.Generic.List[string]]::new()
+    if ($tierRaw -and $tierRaw -notin 'default', 'standard', 'priority', 'flex') {
+        $notes.Add("Unrecognised service_tier '$tierRaw', priced at the default tier.")
+    }
+    elseif (-not $tierRaw -and $ServiceTier -in 'priority', 'flex') {
+        $notes.Add("Requested '$ServiceTier' but the response reported no service_tier; priced at the default tier.")
+    }
+
+    # Cost at response time. Null - never 0 - when it cannot be known, and
+    # BillingModel says which kind of null this is.
+    $cost    = $null
+    $billing = if ($PriceEntry) { $PriceEntry.BillingModel } else { 'NoMeter' }
+    switch ($billing) {
+        'Marketplace' { $notes.Add('Billed through Azure Marketplace, not on the account: tokens are exact, cost can only be estimated.') }
+        'Capacity'    { $notes.Add($PriceEntry.Note) }
+        'Router' {
+            if (-not $served) { $notes.Add('The response named no model, so the routed rates are unknown.'); break }
+            $routed = Get-RoutedPrice -RouterEntry $PriceEntry -ModelName $served
+            $rates  = $routed.Tiers[$tierKey]
+            if ($routed.BillingModel -ne 'Derived' -or -not $rates) {
+                $why = if ($routed.Note) { $routed.Note } else { "no $tierKey-tier meter" }
+                $notes.Add("No list price for routed model '$served': $why"); break
+            }
+            if ($null -eq $PriceEntry.RouterPer1M) { $notes.Add($PriceEntry.Note); break }
+            $c = Measure-TokenCost -Rates $rates -InputTokens $n.InputTokens -CachedTokens $n.CachedReadTokens `
+                     -CacheWriteTokens $n.CacheWriteTokens -OutputTokens $n.OutputTokens
+            if ($null -eq $c.Cost) { $notes.Add($c.Note); break }
+            # The fee applies to every prompt token. Billing showed the fee
+            # quantity equal to the router's input tokens; whether cached
+            # prompt tokens attract it was not separately verified.
+            $fee  = [decimal]$PriceEntry.RouterPer1M * [decimal]($n.InputTokens + $n.CachedReadTokens + $n.CacheWriteTokens) / 1000000
+            $cost = [double][math]::Round([decimal]$c.Cost + $fee, 8)
+            $notes.Add("Routed to $served; includes the router fee ($($PriceEntry.RouterMeter)).")
+            if ($c.Note) { $notes.Add($c.Note) }
+        }
+        'Derived' {
+            $rates = $PriceEntry.Tiers[$tierKey]
+            if (-not $rates) { $notes.Add("No list price for the '$tierKey' service tier on this model."); break }
+            $c = Measure-TokenCost -Rates $rates -InputTokens $n.InputTokens -CachedTokens $n.CachedReadTokens `
+                     -CacheWriteTokens $n.CacheWriteTokens -OutputTokens $n.OutputTokens
+            $cost = $c.Cost
+            if ($c.Note) { $notes.Add($c.Note) }
+            if ($rates.ContextTier -eq 'Short') { $notes.Add('Priced at the Short context band.') }
+        }
+        default {
+            $notes.Add($(if ($PriceEntry -and $PriceEntry.Note) { $PriceEntry.Note } else { 'No price entry for this deployment.' }))
+        }
+    }
+    if ($n.ReasoningInOutput -is [bool] -and -not $n.ReasoningInOutput) {
+        $notes.Add("$($n.ReasoningTokens) reasoning tokens were reported outside completion_tokens and are not priced; for grok-4.3 Azure billed completion_tokens only (Cost Management, Oct 2026).")
+    }
+
+    [pscustomobject]@{
+        Tenant            = $TenantTag
+        Provider          = $n.Provider
+        Deployment        = $Deployment
+        ServedModel       = $served
+        Streamed          = [bool]$Stream
+        StreamComplete    = $complete
+        RequestId         = $requestId
+        ServiceTier       = $tierRaw
+        InputTokens       = $n.InputTokens
+        CachedTokens      = $n.CachedReadTokens
+        CacheWrite        = $n.CacheWriteTokens
+        OutputTokens      = $n.OutputTokens
+        Reasoning         = $n.ReasoningTokens
+        ReasoningInOutput = $n.ReasoningInOutput
+        TotalTokens       = $n.TotalTokens
+        ReportedTotal     = $n.ReportedTotal
+        CostUSD           = $cost
+        BillingModel      = $billing
+        CostNote          = ($notes -join ' ')
+        # Whole-response time as this buffered client sees it; for a stream
+        # that is time to LAST token, not first.
+        WallClockMs       = [int]$sw.ElapsedMilliseconds
+        EngineTtftMs      = $latency.engine_ttft_ms
+        ServiceTtftMs     = $latency.service_ttft_ms
+        Latency           = $latency
     }
 }
 
 # ---------------------------------------------------------------------------
-# 3. TOKEN USAGE  -  Azure Monitor metrics      *** PREFERRED SOURCE ***
+# 4. TOKEN USAGE  -  Azure Monitor metrics
 #
-#    This is the only surface that reports token usage identically for every
-#    publisher. InputTokens / OutputTokens / TotalTokens carry the same name,
-#    unit and dimensions for OpenAI, Anthropic, xAI and DeepSeek deployments
-#    alike, so one query covers the whole account with no per-provider parsing.
+#    One query covers every publisher on the account: InputTokens,
+#    OutputTokens and TotalTokens split by deployment, model and version.
+#    Read key point #1 before summing anything. Token counts are exact, not
+#    sampled.
 #
-#    Prefer it for:
-#      * account-wide and per-deployment totals
-#      * anything that must span publishers
-#      * reconciliation against gateway-side inline counts (bypass detection)
-#      * Anthropic token usage, where no per-model cost meter exists at all
-#
-#    1-minute grain. Token counts are exact, not sampled.
-#
-#    LIMITS YOU MUST DESIGN AROUND
-#      * NO TENANT DIMENSION. Dimensions are ApiName, Region,
-#        ModelDeploymentName, ModelName, ModelVersion. Monitor can tell you a
-#        deployment burned 40k tokens; it cannot tell you which of your tenants
-#        burned them. Per-tenant attribution has to happen in the request path.
-#      * Lag of roughly 2 minutes, so it cannot back a live per-request meter.
-#      * TokensCacheMatchRate and ProvisionedConsumedTokens are PTU-only
-#        metrics. Claude runs Global Standard / Data Zone Standard, so no cache
-#        hit-rate metric is available for it here.
-#
-#    *** DO NOT BILL OutputTokens DIRECTLY ***
-#    The schema is uniform across publishers but the SEMANTICS of OutputTokens
-#    are not. Monitor inherits the xAI reasoning-token quirk from the inference
-#    API: OutputTokens excludes reasoning tokens, TotalTokens includes them.
-#    Measured on grok-4.3: in=34 out=99 total=998, so in+out=133 against a real
-#    billable output of 964.
-#    Use (TotalTokens - InputTokens). It equals OutputTokens for publishers that
-#    are consistent (verified exactly on OpenAI and Anthropic) and recovers the
-#    missing tokens for those that are not.
-#
-#    ModelRequests adds StatusCode, StreamType, IsSpillover, ServiceTierRequest.
+#    VERIFIED BEHAVIOUR (Oct 2026)
+#      * Lag: a request appeared 48-60 s after its response, in the minute
+#        bucket after the one its Date header falls in.
+#      * interval=FULL returns one total per series, equal to the sum of the
+#        fine-grain points. PT1M over 7 days fails (HTTP 400: the response
+#        would pass 8 MB), so ask for FULL unless you need the time series.
+#      * One request covers at most 31 days; a longer timespan is silently
+#        shortened to its last 31 days (HTTP 200).
+#      * top defaults to 10 series. Set it, or a busy account is truncated.
+#      * Metadata names come back lowercase ('modeldeploymentname').
+#      * ModelRequests counts failed calls too - 400, 404, 408, 429, 499 -
+#        so split it by StatusCode. claude-opus-5 logged over 3,000 HTTP 429s
+#        in 30 days, as requests with no tokens.
+#      * For model-router, ModelName is the model each request was routed to,
+#        but ModelVersion on the token metrics is the ROUTER's version
+#        (2025-11-18) whatever model served; ModelRequests carries the served
+#        model's own version. Token metrics have also reported '__Empty' as a
+#        version. Take a deployment's version from its successful requests.
+#      * Claude cache traffic has its own metrics: cacheReadInputTokens,
+#        ephemeral5mInputTokens and ephemeral1hInputTokens (which also split
+#        by ContextLength). There is no cached-token count for the OpenAI
+#        path: those cache hits are inside InputTokens, invisible here.
+#      * ProcessedPromptTokens / GeneratedTokens split by ServiceTierResponse
+#        ('default', 'priority', 'flex') - the only metrics that show which
+#        tier tokens ran at - but have NO ModelName dimension, and only
+#        OpenAI models report them (none for Claude, DeepSeek or grok).
+#      * The token metrics do not reconcile exactly. TotalTokens -
+#        InputTokens - OutputTokens is xAI's unbilled reasoning; elsewhere it
+#        is usually 0, but daily totals were off by up to 0.04% on gpt-6-astra
+#        (either sign) and up to -1% on claude-opus-5-5. Claude's TotalTokens
+#        leaves out cache reads and writes. On model-router, OutputTokens ran
+#        above the billed output (36 against 32 on one day); GeneratedTokens
+#        matched it.
+#      * FoundryModelEstimatedCost is not a bill: for gpt-6-astra it showed
+#        $147.62 over 7 days against $4,072.34 billed.
 # ---------------------------------------------------------------------------
 function Get-TokenUsage {
-    param($SubscriptionId, $ResourceGroup, $AccountName, $Token, [int]$LookbackMins = 60, [string]$Grain = "PT1M")
+    param(
+        [Parameter(Mandatory)][string] $ResourceId,
+        [Parameter(Mandatory)][string] $Token,
+        [ValidateRange(1, 44640)][int] $LookbackMins = 60,
+        [int] $Top = 1000
+    )
 
-    $resourceId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup" +
-                  "/providers/Microsoft.CognitiveServices/accounts/$AccountName"
-
-    $end   = (Get-Date).ToUniversalTime()
+    $inv   = [cultureinfo]::InvariantCulture
+    $end   = [datetime]::UtcNow
     $start = $end.AddMinutes(-$LookbackMins)
-    $span  = "{0:yyyy-MM-ddTHH:mm:ssZ}/{1:yyyy-MM-ddTHH:mm:ssZ}" -f $start, $end
+    $fmt   = "yyyy-MM-dd'T'HH':'mm':'ss'Z'"
+    $span  = $start.ToString($fmt, $inv) + '/' + $end.ToString($fmt, $inv)
 
-    # Splitting by both deployment and model lets the gateway attribute spend
-    # to the tenant that owns the deployment.
-    $filter = [uri]::EscapeDataString("ModelDeploymentName eq '*' and ModelName eq '*'")
+    $query = {
+        param([string] $Metrics, [string] $Filter)
+        $uri = "https://management.azure.com$ResourceId/providers/microsoft.insights/metrics" +
+               "?api-version=2024-02-01&metricnames=$Metrics&timespan=$span&interval=FULL" +
+               "&aggregation=Total&top=$Top&`$filter=" + [uri]::EscapeDataString($Filter)
+        $resp = Invoke-ArmWithRetry -Uri $uri -Token $Token
 
-    $uri = "https://management.azure.com$resourceId/providers/microsoft.insights/metrics" +
-           "?api-version=2024-02-01" +
-           "&metricnames=InputTokens,OutputTokens,TotalTokens,ModelRequests" +
-           "&timespan=$span&interval=$Grain&aggregation=Total&`$filter=$filter"
-
-    $resp = Invoke-ArmWithRetry -Uri $uri -Token $Token
-
-    $rows = @()
-    foreach ($metric in $resp.value) {
-        foreach ($series in $metric.timeseries) {
-            $dep   = ($series.metadatavalues | Where-Object { $_.name.value -eq 'modeldeploymentname' }).value
-            $model = ($series.metadatavalues | Where-Object { $_.name.value -eq 'modelname' }).value
-            foreach ($pt in ($series.data | Where-Object { $_.total -gt 0 })) {
-                $rows += [pscustomobject]@{
-                    TimeStamp  = [datetime]$pt.timeStamp
-                    Metric     = $metric.name.value
-                    Deployment = $dep
-                    Model      = $model
-                    Total      = [long]$pt.total
+        $from = $null
+        if ($resp.timespan) {
+            $from = [datetimeoffset]::Parse(($resp.timespan -split '/')[0], $inv).UtcDateTime
+            if ($from -gt $start.AddMinutes(5)) {
+                Write-Warning "Azure Monitor returned data from $($from.ToString('u', $inv)) only, not $($start.ToString('u', $inv)): one request covers at most 31 days."
+            }
+        }
+        foreach ($metric in @($resp.value)) {
+            $series = @($metric.timeseries)
+            if ($series.Count -ge $Top) {
+                Write-Warning "$($metric.name.value): $($series.Count) series returned, the -Top limit. Totals may be truncated; raise -Top."
+            }
+            foreach ($s in $series) {
+                $md = @{}
+                foreach ($mv in @($s.metadatavalues)) { $md[$mv.name.value] = $mv.value }
+                $total = [long]0
+                foreach ($pt in @($s.data)) { if ($null -ne $pt.total) { $total += [long]$pt.total } }
+                if ($total -le 0) { continue }
+                [pscustomobject]@{
+                    Timespan    = $resp.timespan
+                    Metric      = $metric.name.value
+                    Deployment  = $md['modeldeploymentname']
+                    Model       = $md['modelname']
+                    Version     = $md['modelversion']
+                    ServiceTier = $md['servicetierresponse']
+                    StatusCode  = $md['statuscode']
+                    Total       = $total
                 }
             }
         }
     }
-    $rows
+
+    # (a) Token totals, every publisher. Required.
+    & $query 'InputTokens,OutputTokens,TotalTokens' `
+             "ModelDeploymentName eq '*' and ModelName eq '*' and ModelVersion eq '*'"
+    # (b) Request counts by HTTP status. Required: unsplit, ModelRequests
+    # mixes failed calls in with the served ones.
+    & $query 'ModelRequests' `
+             "ModelDeploymentName eq '*' and ModelName eq '*' and ModelVersion eq '*' and StatusCode eq '*'"
+
+    # (c) Claude cache metrics. (d) Tokens per service tier. Both optional:
+    # an account without such traffic must not fail the whole call.
+    try {
+        & $query 'cacheReadInputTokens,ephemeral5mInputTokens,ephemeral1hInputTokens' `
+                 "ModelDeploymentName eq '*' and ModelName eq '*' and ModelVersion eq '*'"
+    } catch { Write-Warning "Claude cache metrics unavailable: $($_.Exception.Message)" }
+    try {
+        & $query 'ProcessedPromptTokens,GeneratedTokens' "ModelDeploymentName eq '*' and ServiceTierResponse eq '*'"
+    } catch { Write-Warning "Service-tier metrics unavailable: $($_.Exception.Message)" }
 }
 
 # ---------------------------------------------------------------------------
-# 4. BILLED COST  -  Cost Management Query API
-#    Hours of lag. HEAVILY THROTTLED - 4 consecutive 429s observed before a
-#    single query succeeded. Do NOT put this on a user-facing refresh path.
-#    Run it on a schedule (hourly at most) and cache the result.
+# 5. THE JOIN  -  near-real-time cost: Monitor tokens (4) x list prices (2)
 #
-#    GOTCHA: timePeriod is only honoured when timeframe = "Custom".
-#            Any other timeframe value returns HTTP 400.
+#    About a minute behind instead of hours. An estimate, for these reasons:
+#      * It prices InputTokens and OutputTokens, as Azure bills them - not
+#        TotalTokens - InputTokens, which would bill xAI reasoning that Azure
+#        did not charge for. TotalTokens - InputTokens - OutputTokens is
+#        reported as ResidualTokens, for diagnosis only: xAI reasoning, or a
+#        small skew between the metrics (section 4).
+#      * OpenAI-path InputTokens include cached tokens and Monitor does not
+#        break them out, so all input is priced uncached. On gpt-6-astra
+#        (96.2% of input cached) that came to $18,150 against $2,963.56
+#        billed - about 6.1x. Nor is it a strict upper bound: cache writes
+#        bill above the input rate.
+#      * Models priced only in Short and Long context bands are priced at
+#        Short. Long-context requests bill higher (input x2, output x1.5 to x2).
+#      * A deployment that served Priority or Flex traffic is priced per tier
+#        from ProcessedPromptTokens / GeneratedTokens.
+#      * List prices: no EA, MACC or negotiated discount.
+#
+#    BillingModel says why a cost is null:
+#      Derived      priced from the Retail Prices API
+#      Router       router fee + the routed model's rates
+#      Marketplace  Claude: billed through Azure Marketplace (section 6)
+#      Capacity     provisioned throughput: billed per hour, not per token
+#      NoMeter      no list price - a coverage gap to alert on
 # ---------------------------------------------------------------------------
-function Get-BilledCost {
-    param($SubscriptionId, $Token, [int]$Days = 5)
+function Get-NearRealTimeCost {
+    param(
+        $Usage,
+        [Parameter(Mandatory)][hashtable] $PriceOf,              # deployment -> Resolve-ModelPrice entry
+        [hashtable] $PublisherOfDeployment = @{}
+    )
 
-    $body = @{
-        type      = "ActualCost"
-        timeframe = "Custom"
-        timePeriod = @{
-            from = (Get-Date).AddDays(-$Days).ToString("yyyy-MM-ddT00:00:00Z")
-            to   = (Get-Date).ToString("yyyy-MM-ddT23:59:59Z")
+    function Get-Sum($rows, [string] $metric) {
+        [long](($rows | Where-Object Metric -eq $metric | Measure-Object Total -Sum).Sum)
+    }
+
+    $tierMetrics = 'ProcessedPromptTokens', 'GeneratedTokens'
+    $tokenRows   = @($Usage | Where-Object { $_.Metric -notin $tierMetrics })
+    $tierRows    = @($Usage | Where-Object { $_.Metric -in $tierMetrics })
+
+    foreach ($dg in ($tokenRows | Group-Object Deployment)) {
+        $dep   = $dg.Name
+        $entry = $PriceOf[$dep]
+        $billing = if ($entry) { $entry.BillingModel } else { 'NoMeter' }
+
+        # A router deployment serves several models at different rates, so
+        # it gets one row per routed model; any other deployment, one row.
+        # Not split by version: the router's token metrics carry its own.
+        $parts = [System.Collections.Generic.List[object]]::new()
+        if ($billing -eq 'Router') { foreach ($g in ($dg.Group | Group-Object Model)) { $parts.Add(@($g.Group)) } }
+        else                       { $parts.Add(@($dg.Group)) }
+
+        foreach ($rows in $parts) {
+            $in  = Get-Sum $rows 'InputTokens'
+            $out = Get-Sum $rows 'OutputTokens'
+            $tot = Get-Sum $rows 'TotalTokens'
+            $okRows   = @($rows | Where-Object { $_.Metric -eq 'ModelRequests' -and (-not $_.StatusCode -or "$($_.StatusCode)" -like '2*') })
+            $okCount  = [long](($okRows | Measure-Object Total -Sum).Sum)
+            $models   = @($rows.Model | Where-Object { $_ } | Sort-Object -Unique)
+            # The version that served, from successful requests only. Outside
+            # a router, the token metrics' version will do as a fallback.
+            $versions = @($okRows.Version | Where-Object { $_ -and $_ -ne '__Empty' } | Sort-Object -Unique)
+            if (-not $versions -and $billing -ne 'Router') {
+                $versions = @(($rows | Where-Object Metric -ne 'ModelRequests').Version | Where-Object { $_ -and $_ -ne '__Empty' } | Sort-Object -Unique)
+            }
+            $pub      = $PublisherOfDeployment[$dep]
+            $cost = $null; $basis = $null; $split = $null
+            $notes = [System.Collections.Generic.List[string]]::new()
+
+            switch ($billing) {
+                'Marketplace' { $notes.Add('Claude: billed through Azure Marketplace (section 6). Tokens are exact; cost is not on the account.') }
+                'Capacity'    { $notes.Add($entry.Note) }
+                'NoMeter'     { $notes.Add($(if ($entry) { $entry.Note } else { "'$dep' is not a current deployment on the account." })) }
+                'Router' {
+                    $basis = 'InputTokens x (router fee + routed input) + OutputTokens x routed output'
+                    if (-not $models) { $notes.Add('No routed model name in Monitor.'); break }
+                    if ($models[0] -eq 'model-router') { $notes.Add('Not attributed to a routed model.'); break }
+                    # The routed model's own version picks between dated
+                    # meters (gpt-4o 0513 / 0806 / 1120 differ 2x).
+                    $routed = Get-RoutedPrice -RouterEntry $entry -ModelName $models[0] -Version $(if ($versions.Count -eq 1) { $versions[0] })
+                    $pub    = $routed.Publisher
+                    $rates  = $routed.Tiers['default']
+                    if (-not $rates)                     { $notes.Add("No list price for routed model '$($models[0])': $($routed.Note)"); break }
+                    if ($null -eq $entry.RouterPer1M)    { $notes.Add($entry.Note); break }
+                    if ($out -gt 0 -and $null -eq $rates.OutputPer1M) { $notes.Add("No output rate for routed model '$($models[0])'."); break }
+                    [decimal] $acc = [decimal]$in * ([decimal]$entry.RouterPer1M + [decimal]$rates.InputPer1M)
+                    if ($out -gt 0) { $acc += [decimal]$out * [decimal]$rates.OutputPer1M }
+                    $cost = [double][math]::Round($acc / 1000000, 8)
+                    $notes.Add('Cached prompt tokens are not visible in Monitor; all input priced uncached.')
+                }
+                'Derived' {
+                    $byTier = @{}
+                    foreach ($t in @($tierRows | Where-Object Deployment -eq $dep)) {
+                        $k = if ("$($t.ServiceTier)" -in 'priority', 'flex') { "$($t.ServiceTier)".ToLowerInvariant() } else { 'default' }
+                        if (-not $byTier.ContainsKey($k)) { $byTier[$k] = @{ PP = [long]0; Gen = [long]0 } }
+                        if ($t.Metric -eq 'ProcessedPromptTokens') { $byTier[$k].PP += $t.Total } else { $byTier[$k].Gen += $t.Total }
+                    }
+                    $otherTiers = @($byTier.Keys | Where-Object { $_ -ne 'default' -and ($byTier[$_].PP + $byTier[$_].Gen) -gt 0 })
+                    if ($otherTiers.Count -gt 0) {
+                        # Priority / Flex traffic: price each tier's tokens at
+                        # its own meters. A tier with no meter makes the whole
+                        # figure unknown rather than understated.
+                        $basis = 'ProcessedPromptTokens / GeneratedTokens per service tier'
+                        $split = (@($byTier.Keys | Sort-Object | ForEach-Object { "$_ $($byTier[$_].PP)/$($byTier[$_].Gen)" }) -join '; ')
+                        [decimal] $acc = 0; $known = $true
+                        foreach ($k in ($byTier.Keys | Sort-Object)) {
+                            $pp = $byTier[$k].PP; $gen = $byTier[$k].Gen
+                            if ($pp + $gen -eq 0) { continue }
+                            $rates = $entry.Tiers[$k]
+                            if (-not $rates -or ($gen -gt 0 -and $null -eq $rates.OutputPer1M)) {
+                                $known = $false; $notes.Add("$pp prompt / $gen generated tokens ran at the '$k' tier, which has no list price here."); continue
+                            }
+                            $acc += [decimal]$pp * [decimal]$rates.InputPer1M
+                            if ($gen -gt 0) { $acc += [decimal]$gen * [decimal]$rates.OutputPer1M }
+                        }
+                        if ($known) { $cost = [double][math]::Round($acc / 1000000, 8) }
+                    }
+                    else {
+                        $basis = 'InputTokens x input + OutputTokens x output (default tier)'
+                        $c = Measure-TokenCost -Rates $entry.Tiers['default'] -InputTokens $in -OutputTokens $out
+                        $cost = $c.Cost
+                        if ($c.Note) { $notes.Add($c.Note) }
+                    }
+                    if ($entry.Tiers['default'].ContextTier -eq 'Short') { $notes.Add('Short context band assumed.') }
+                    $notes.Add('Cached prompt tokens are not visible in Monitor; all input priced uncached.')
+                }
+            }
+
+            [pscustomobject]@{
+                Deployment       = $dep
+                Model            = ($models -join ',')
+                Version          = ($versions -join ',')
+                Publisher        = $pub
+                Requests         = $okCount
+                FailedRequests   = (Get-Sum $rows 'ModelRequests') - $okCount
+                InputTokens      = $in
+                OutputTokens     = $out
+                TotalTokens      = $tot
+                ResidualTokens   = $tot - $in - $out
+                CacheReadTokens  = Get-Sum $rows 'cacheReadInputTokens'
+                CacheWriteTokens = (Get-Sum $rows 'ephemeral5mInputTokens') + (Get-Sum $rows 'ephemeral1hInputTokens')
+                TierSplit        = $split
+                EstCostUSD       = $cost
+                BillingModel     = $billing
+                Basis            = $basis
+                Note             = ($notes -join ' ')
+            }
         }
-        dataset = @{
-            granularity = "Daily"
-            aggregation = @{ totalCost = @{ name = "Cost"; function = "Sum" } }
-            grouping    = @(@{ type = "Dimension"; name = "MeterCategory" })
-        }
-    } | ConvertTo-Json -Depth 10
-
-    $uri = "https://management.azure.com/subscriptions/$SubscriptionId" +
-           "/providers/Microsoft.CostManagement/query?api-version=2024-08-01"
-
-    $resp = Invoke-ArmWithRetry -Uri $uri -Method Post -Body $body -Token $Token
-
-    $cols = $resp.properties.columns.name
-    foreach ($row in $resp.properties.rows) {
-        $o = [ordered]@{}
-        for ($i = 0; $i -lt $cols.Count; $i++) { $o[$cols[$i]] = $row[$i] }
-        [pscustomobject]$o
     }
 }
 
 # ---------------------------------------------------------------------------
-# 5. THE JOIN  -  near-real-time cost attribution
-#    Monitor token metrics (~1-3 min) x cached unit price = per-deployment cost
-#    at 1-minute grain, instead of waiting hours for Cost Management.
+# 6. BILLED COST  -  Cost Management Query API
 #
-#    BillingModel distinguishes three outcomes that must not be conflated:
-#      Derived  - priced from the Retail Prices API, EstCostUSD is a number
-#      CCU      - Anthropic; bills via Marketplace with no per-model meter, so
-#                 cost is permanently null here BY DESIGN, not pending a fix
-#      NoMeter  - a real coverage gap; alert on this one
+#    The invoice view: hours behind (over 5 hours observed) and heavily
+#    throttled. Run it on a schedule and cache the result - never on a
+#    user-facing path.
+#
+#    VERIFIED BEHAVIOUR (Oct 2026)
+#      * timePeriod requires timeframe 'Custom', and 'Custom' requires
+#        timePeriod; either mismatch is HTTP 400. Usage dates are UTC days.
+#      * 429s carry x-ms-ratelimit-microsoft.costmanagement-{qpu,entity,
+#        tenant,clienttype}-retry-after headers (Invoke-ArmWithRetry).
+#      * Pages continue at properties.nextLink: POST the same body to it.
+#      * Filters are case-insensitive.
+#      * The 'deployment' tag (value lowercased) joins rows to Monitor's
+#        ModelDeploymentName. Some meters on the account carry no deployment
+#        tag: 'Standard Tokens' (Defender for AI), 'Platform Logs Data
+#        Processed', 'Hosted Memory Usage' and 'Hosted vCPU Usage'.
+#      * UnitOfMeasure differs by meter ('1M', '1K', '1 Hour', '1 GB'): add up
+#        cost, never quantities across meters.
+#      * model-router bills a fee meter ('Model Routers GL 1M Tokens') plus
+#        the routed models' own meters, all under the router's deployment tag.
+#      * Claude is not on the account. Its charges are on Marketplace SaaS
+#        resources (MeterCategory 'SaaS'; here, in the account's resource
+#        group), queried separately below; free test plans show as $0. Those
+#        rows carry no deployment tag, and a resource's name does not say
+#        which deployment it bills: one named 'claude-opus-5-5-...' carried
+#        claude-opus-5's usage - its daily CCU followed that deployment's
+#        Monitor tokens, idle days included, and began six days before any
+#        deployment named claude-opus-5-5 existed - while another of the
+#        same name carried claude-opus-5-5's. Neither ARM nor Resource Graph
+#        returned these resource IDs. What the name does carry is the first
+#        15 characters of the account's internalId.
 # ---------------------------------------------------------------------------
-function Get-NearRealTimeCost {
-    param($Usage, $PriceTable, $CcuModels = @{})
+function Get-BilledCost {
+    param(
+        [Parameter(Mandatory)][string] $SubscriptionId,
+        [Parameter(Mandatory)][string] $ResourceGroup,
+        [Parameter(Mandatory)][string] $AccountResourceId,
+        [Parameter(Mandatory)][string] $Token,
+        [string] $AccountInternalId,    # the account's properties.internalId
+        [ValidateRange(0, 365)][int] $Days = 5
+    )
 
-    $byDeployment = $Usage |
-        Where-Object { $_.Metric -in @('InputTokens', 'OutputTokens', 'TotalTokens') } |
-        Group-Object Deployment, Model
+    $inv   = [cultureinfo]::InvariantCulture
+    $today = [datetime]::UtcNow.Date
+    $uri   = "https://management.azure.com/subscriptions/$SubscriptionId" +
+             "/providers/Microsoft.CostManagement/query?api-version=2024-08-01"
 
-    foreach ($g in $byDeployment) {
-        $dep   = $g.Group[0].Deployment
-        $model = $g.Group[0].Model
-        $in    = ($g.Group | Where-Object { $_.Metric -eq 'InputTokens'  } | Measure-Object Total -Sum).Sum
-        $out   = ($g.Group | Where-Object { $_.Metric -eq 'OutputTokens' } | Measure-Object Total -Sum).Sum
-        $tot   = ($g.Group | Where-Object { $_.Metric -eq 'TotalTokens'  } | Measure-Object Total -Sum).Sum
-
-        # *** DO NOT BILL OutputTokens DIRECTLY. ***
-        # Azure Monitor inherits the same reasoning-token quirk as the inference
-        # API: for xAI, OutputTokens EXCLUDES reasoning tokens while TotalTokens
-        # includes them. Measured on grok-4.3:
-        #     in=34  out=99  total=998
-        #     in + out      = 133   <- what a naive dashboard shows
-        #     total - in    = 964   <- actual billable output
-        # That is a 7x under-report of output on a reasoning workload.
-        #
-        # (TotalTokens - InputTokens) is correct for EVERY publisher measured:
-        #   claude-opus-5-5  in 6803   out 322316  total 329119  -> total-in = out
-        #   gpt-4.1-mini     in 1639   out 739     total 2378    -> total-in = out
-        #   grok-4.3         in 34     out 99      total 998     -> total-in = 964
-        # So it equals OutputTokens where the publisher is consistent and
-        # recovers the missing reasoning tokens where it is not.
-        #
-        # The fallback is NOT equivalent. If the TotalTokens series is missing
-        # for a window, raw OutputTokens reintroduces exactly the xAI
-        # under-report this function exists to prevent, so say so rather than
-        # quietly emitting a low number.
-        if ($null -ne $tot -and $null -ne $in -and $tot -gt 0) {
-            $billableOut = $tot - $in
+    $newBody = {
+        param($Grouping, $Filter)
+        @{
+            type       = 'ActualCost'
+            timeframe  = 'Custom'
+            timePeriod = @{
+                from = $today.AddDays(-$Days).ToString("yyyy-MM-dd'T00:00:00Z'", $inv)
+                to   = $today.ToString("yyyy-MM-dd'T23:59:59Z'", $inv)
+            }
+            dataset    = @{
+                granularity = 'None'
+                aggregation = @{
+                    totalCost     = @{ name = 'Cost';          function = 'Sum' }
+                    totalQuantity = @{ name = 'UsageQuantity'; function = 'Sum' }
+                }
+                grouping    = $Grouping
+                filter      = $Filter
+            }
         }
-        else {
-            $billableOut = $out
-            Write-Warning ("No TotalTokens for '{0}' in this window; falling back to raw OutputTokens. " -f $model +
-                           "This UNDER-REPORTS output on publishers that exclude reasoning tokens (xAI). Widen -LookbackMins or re-poll.")
+    }
+    $runQuery = {
+        param($Body)
+        $next = $uri
+        while ($next) {
+            $resp = Invoke-ArmWithRetry -Uri $next -Method Post -Body $Body -Token $Token
+            $cols = @($resp.properties.columns.name)
+            foreach ($row in @($resp.properties.rows)) {
+                $o = @{}
+                for ($i = 0; $i -lt $cols.Count; $i++) { $o[$cols[$i]] = $row[$i] }
+                $o
+            }
+            $next = $resp.properties.nextLink
         }
+    }
 
-        $price = $PriceTable[$model]
-        $cost  = $null
-        $billingModel = 'NoMeter'
-
-        if ($CcuModels -and $CcuModels.ContainsKey($model)) {
-            # Claude. Tokens are exact; cost is not derivable at model grain.
-            $billingModel = 'CCU'
-        }
-        elseif ($price) {
-            $billingModel = 'Derived'
-            $cost = [math]::Round(
-                ($in          / 1000000 * $price.InputPer1M) +
-                ($billableOut / 1000000 * $price.OutputPer1M), 6)
-        }
-
+    # The Foundry account, per deployment tag and meter.
+    $accountBody = & $newBody `
+        @(@{ type = 'TagKey'; name = 'deployment' }, @{ type = 'Dimension'; name = 'Meter' }, @{ type = 'Dimension'; name = 'UnitOfMeasure' }) `
+        @{ dimensions = @{ name = 'ResourceId'; operator = 'In'; values = @($AccountResourceId) } }
+    foreach ($o in (& $runQuery $accountBody)) {
         [pscustomobject]@{
-            Deployment     = $dep
-            Model          = $model
-            InputTokens    = $in
-            OutputTokens   = $billableOut   # reasoning-inclusive, the billable figure
-            ReportedOutput = $out           # raw metric; lower than billable on xAI
-            TotalTokens    = $tot
-            EstCostUSD     = $cost          # $null for both CCU and NoMeter
-            BillingModel   = $billingModel  # tells you WHY it is null
+            Source     = 'Foundry account'
+            Deployment = if ($o['TagValue']) { $o['TagValue'] } else { '(untagged)' }
+            Resource   = $null
+            Meter      = $o['Meter']
+            Unit       = $o['UnitOfMeasure']
+            Quantity   = $o['UsageQuantity']
+            Cost       = $o['Cost']
+            Currency   = $o['Currency']
+        }
+    }
+
+    # Claude: Marketplace SaaS resources, from the whole subscription. A name
+    # ending '-<15 hex>-<32 hex>' carries an account's internalId prefix:
+    # kept when it is this account's, dropped when another's, wherever the
+    # resource group. Any other SaaS row is kept only if it is in the
+    # account's resource group and its meter or resource names Claude - a
+    # name match, which is all the data offers. Reported per resource, never
+    # per deployment (see above).
+    $saasBody = & $newBody `
+        @(@{ type = 'Dimension'; name = 'ResourceId' }, @{ type = 'Dimension'; name = 'Meter' }, @{ type = 'Dimension'; name = 'UnitOfMeasure' }) `
+        @{ dimensions = @{ name = 'MeterCategory'; operator = 'In'; values = @('SaaS') } }
+    $idPrefix = if ($AccountInternalId.Length -ge 15) { $AccountInternalId.Substring(0, 15) }
+    foreach ($o in (& $runQuery $saasBody)) {
+        $id   = "$($o['ResourceId'])"
+        $name = ($id -split '/')[-1]
+        if ($idPrefix -and $name -match '-([0-9a-f]{15})-[0-9a-f]{32}$') {
+            if ($Matches[1] -ne $idPrefix) { continue }
+        }
+        elseif ($id -notmatch "/resourcegroups/$([regex]::Escape($ResourceGroup))/" -or
+                ("$($o['Meter'])" -notmatch 'claude' -and $name -notmatch '^claude')) { continue }
+        [pscustomobject]@{
+            Source     = 'Marketplace'
+            Deployment = $null
+            Resource   = $name
+            Meter      = $o['Meter']
+            Unit       = $o['UnitOfMeasure']
+            Quantity   = $o['UsageQuantity']
+            Cost       = $o['Cost']
+            Currency   = $o['Currency']
         }
     }
 }
 
 # =============================== DEMO =======================================
 
-if (-not $SubscriptionId) { $SubscriptionId = az account show --query id -o tsv }
-if (-not $ResourceGroup)  {
-    $ResourceGroup = az cognitiveservices account list `
-        --query "[?name=='$AccountName'].resourceGroup" -o tsv
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+    throw "The Azure CLI ('az') is required: https://learn.microsoft.com/cli/azure/install-azure-cli - then sign in with 'az login'."
+}
+if (-not $SubscriptionId) {
+    $SubscriptionId = az account show --query id -o tsv
+    if ($LASTEXITCODE -ne 0 -or -not $SubscriptionId) { throw "No Azure CLI subscription. Run 'az login', or pass -SubscriptionId." }
+}
+$armToken = Get-EntraToken -Resource 'https://management.azure.com' -SubscriptionId $SubscriptionId
+
+if (-not $ResourceGroup) {
+    $found = @(Get-ArmCollection -Token $armToken `
+                 -Uri "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.CognitiveServices/accounts?api-version=2024-10-01" |
+               Where-Object { $_.name -eq $AccountName })
+    if ($found.Count -ne 1) {
+        throw "Found $($found.Count) accounts named '$AccountName' in subscription $SubscriptionId. Check the name, or pass -ResourceGroup."
+    }
+    $ResourceGroup = ($found[0].id -split '/')[4]
+}
+$accountId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.CognitiveServices/accounts/$AccountName"
+$account   = Invoke-ArmWithRetry -Uri "https://management.azure.com${accountId}?api-version=2024-10-01" -Token $armToken
+if (-not $Region) { $Region = $account.location }
+# The 'AI Foundry API' endpoint (<account>.services.ai.azure.com) serves every
+# publisher. Accounts of kind 'OpenAI' have only properties.endpoint.
+$endpoint = $account.properties.endpoints.'AI Foundry API'
+if (-not $endpoint) { $endpoint = $account.properties.endpoint }
+
+Write-Host "`nAccount $AccountName ($($account.kind), $($account.location)) in resource group $ResourceGroup" -ForegroundColor Green
+
+# ---- 1 ----
+Write-Host "`n=== 1. CATALOG AND DEPLOYMENTS (ARM, real time) ===" -ForegroundColor Cyan
+$deployments = @(Get-FoundryDeployments -AccountResourceId $accountId -Token $armToken)
+$catalog     = @(Get-FoundryModelCatalog -SubscriptionId $SubscriptionId -Region $Region -Token $armToken -Kind $account.kind)
+Write-Host "$($catalog.Count) models deployable in $Region on an account of kind '$($account.kind)'; $($deployments.Count) deployments on $AccountName."
+
+$catalogByName = @{}
+foreach ($c in $catalog) { $catalogByName[$c.Name] = $c }
+$deployments | Sort-Object Deployment | ForEach-Object {
+    $c = $catalogByName[$_.Model]
+    $v = if ($c -and $_.Version) { $c.ByVersion[[string]$_.Version] } else { $null }
+    [pscustomobject]@{
+        Deployment = $_.Deployment
+        Model      = $_.Model
+        Version    = $_.Version
+        Publisher  = $_.Publisher
+        Sku        = $_.Sku
+        State      = $_.State
+        # The DEPLOYED version's lifecycle, not the catalog default's.
+        Lifecycle  = if ($v) { $v.Lifecycle } else { 'not in catalog' }
+        Retires    = if ($v) { $v.InferenceRetirement } else { $null }
+    }
+} | Format-Table -AutoSize
+
+# ---- 2 ----
+Write-Host "=== 2. UNIT PRICING (Retail Prices API; list prices, cache daily) ===" -ForegroundColor Cyan
+# Rates come from the real price table, never hardcoded: hardcoded rates in a
+# cost path are what this repo argues against, so the demo does not use them.
+$builder = Join-Path $PSScriptRoot 'Build-FoundryPriceTable.ps1'
+if (-not (Test-Path $builder)) {
+    throw "Build-FoundryPriceTable.ps1 must be next to this script: it builds the price table that sections 2, 3 and 5 use."
+}
+. $builder
+$priceTable = Build-FoundryPriceTable -Region $Region -CachePath (Join-Path ([IO.Path]::GetTempPath()) "foundry-prices-$Region.json")
+$built = $priceTable.BuiltAtUtc
+if ($built -is [datetime]) { $built = $built.ToUniversalTime().ToString('yyyy-MM-dd HH:mm', [cultureinfo]::InvariantCulture) }
+Write-Host "$($priceTable.MeterCount) token meters in $Region, built $built UTC. LIST prices - no negotiated discount."
+
+$routerMeters = @()
+if ($deployments.Model -contains 'model-router') {
+    $routerMeters = @(Get-AzureRetailPrices -Filter "serviceName eq 'Foundry Tools' and armRegionName eq '$Region' and contains(meterName, 'Model Routers')")
 }
 
-$token = Get-ArmToken
+# Publisher per model name, for models model-router routes to. The live
+# deployment list is more authoritative than the regional catalog for models
+# actually in use, so it wins.
+$publisherOf = @{}
+foreach ($c in $catalog)     { if ($c.Name  -and $c.Format)    { $publisherOf[$c.Name]  = $c.Format } }
+foreach ($d in $deployments) { if ($d.Model -and $d.Publisher) { $publisherOf[$d.Model] = $d.Publisher } }
 
-# Resolve deployments with their publishers. The publisher is required for
-# inline metering; a hardcoded name or an assumed publisher is the most likely
-# first-run failure on someone else's subscription.
-$deployments = Get-FoundryDeployments -AccountName $AccountName -ResourceGroup $ResourceGroup
+$priceOf = @{}
+$publisherOfDeployment = @{}
+foreach ($d in $deployments) {
+    $publisherOfDeployment[$d.Deployment] = $d.Publisher
+    $priceOf[$d.Deployment] = Resolve-ModelPrice -Table $priceTable -ModelName $d.Model -Publisher $d.Publisher `
+        -Sku $d.Sku -Version $d.Version -RouterMeters $routerMeters -PublisherOf $publisherOf
+}
 
-Write-Host "`n=== 0. INLINE METERING (per-tenant attribution only) ===" -ForegroundColor Green
-Write-Host "Azure Monitor (section 3) is the preferred source for totals." -ForegroundColor DarkGray
-Write-Host "Inline metering exists because Monitor has no tenant dimension.`n" -ForegroundColor DarkGray
+$priceRows = foreach ($d in ($deployments | Sort-Object Deployment)) {
+    $e = $priceOf[$d.Deployment]
+    if ($e.BillingModel -eq 'Router') {
+        [pscustomobject]@{ Deployment = $d.Deployment; Billing = 'Router'; Tier = '-'; Context = '-'
+                           'Input/1M' = Format-Number $e.RouterPer1M; 'Cached/1M' = '-'; 'CacheWrite/1M' = '-'; 'Output/1M' = '-' }
+        continue
+    }
+    if ($e.Tiers.Count -eq 0) {
+        [pscustomobject]@{ Deployment = $d.Deployment; Billing = $e.BillingModel; Tier = '-'; Context = '-'
+                           'Input/1M' = 'n/a'; 'Cached/1M' = 'n/a'; 'CacheWrite/1M' = 'n/a'; 'Output/1M' = 'n/a' }
+        continue
+    }
+    foreach ($tier in 'default', 'priority', 'flex') {
+        $r = $e.Tiers[$tier]
+        if (-not $r) { continue }
+        [pscustomobject]@{
+            Deployment      = $d.Deployment
+            Billing         = $e.BillingModel
+            Tier            = $tier
+            Context         = $r.ContextTier
+            'Input/1M'      = Format-Number $r.InputPer1M
+            'Cached/1M'     = Format-Number $r.CachedInputPer1M
+            'CacheWrite/1M' = Format-Number $r.CacheWritePer1M
+            'Output/1M'     = Format-Number $r.OutputPer1M
+        }
+    }
+}
+$priceRows | Format-Table -AutoSize
+foreach ($d in ($deployments | Sort-Object Deployment)) {
+    $e = $priceOf[$d.Deployment]
+    if ($e.BillingModel -eq 'Router') {
+        $feeText = if ($e.RouterMeter) { "'$($e.RouterMeter)' at `$$(Format-Number $e.RouterPer1M) per 1M input tokens" } else { $e.Note }
+        Write-Host "  $($d.Deployment) [Router]: router fee $feeText, plus the routed model's own rates." -ForegroundColor DarkGray
+    }
+    elseif ($e.BillingModel -ne 'Derived') {
+        Write-Host "  $($d.Deployment) [$($e.BillingModel)]: $($e.Note)" -ForegroundColor DarkYellow
+    }
+}
 
-if (-not $deployments) {
-    Write-Warning "No model deployments found on '$AccountName'. Skipping inline metering."
+# ---- 3 ----
+if ($SkipInference) {
+    Write-Host "`n=== 3. INLINE METERING - skipped (-SkipInference) ===" -ForegroundColor Cyan
+}
+elseif (-not $deployments) {
+    Write-Warning "No deployments on '$AccountName'; skipping inline metering."
 }
 else {
+    Write-Host "`n=== 3. INLINE METERING (the inference response, per request) ===" -ForegroundColor Cyan
     # Exercise ONE deployment per publisher so provider-specific handling is
     # actually covered rather than assumed. A single-provider smoke test is how
     # the Anthropic and xAI defects survived in the first place.
     $targets = if ($Deployment) {
-        $deployments | Where-Object { $_.Deployment -eq $Deployment }
+        @($deployments | Where-Object Deployment -eq $Deployment)
     } else {
         # Exclude non-chat deployments before picking. Embedding, audio and image
-        # models carry format='OpenAI' too, so an unfiltered Group[0] can hand a
+        # models carry format='OpenAI' too, so an unfiltered pick can hand a
         # chat-completions payload to an embedding deployment purely on ARM
         # ordering - a confusing first-run failure that looks like a bug here.
-        $deployments |
-            Where-Object { $_.Model -notmatch 'embedding|whisper|tts|dall-e|sora|image|audio|realtime|moderation' } |
-            Group-Object Publisher | ForEach-Object { $_.Group[0] }
+        # model-router is left to -Deployment: its price depends on where it
+        # routes.
+        @($deployments |
+            Where-Object { $_.State -eq 'Succeeded' -and $_.Model -ne 'model-router' -and
+                           $_.Model -notmatch 'embedding|whisper|tts|transcribe|dall-e|sora|image|audio|realtime|moderation' } |
+            Sort-Object Deployment | Group-Object Publisher | ForEach-Object { $_.Group[0] })
     }
-
     if (-not $targets) { Write-Warning "Deployment '$Deployment' not found on '$AccountName'." }
 
-    # Illustrative rates so this section runs standalone. Build the real table
-    # with Build-FoundryPriceTable.ps1 - do not hardcode prices in production.
-    $inlinePrices = @{}
-    foreach ($t in $targets) {
-        $inlinePrices[$t.Deployment] = @{ InputPer1M = 2.00; CachedInputPer1M = 0.50; CacheWritePer1M = 2.50; OutputPer1M = 8.00 }
-    }
-
-    # services.ai.azure.com serves BOTH /openai and /anthropic. The older
-    # <account>.openai.azure.com host does not route /anthropic, so a gateway
-    # fronting mixed publishers must use the services.ai hostname.
-    $endpoint = "https://$AccountName.services.ai.azure.com"
-    $msgs     = @(@{ role = "user"; content = "Reply with exactly: ok" })
-
-    $inlineResults = foreach ($t in $targets) {
-        Invoke-MeteredCompletion -Endpoint $endpoint -Deployment $t.Deployment -Publisher $t.Publisher `
-            -Messages $msgs -PriceTable $inlinePrices -MaxTokens 16 -TenantTag "tenant-$($t.Publisher)"
-        Invoke-MeteredCompletion -Endpoint $endpoint -Deployment $t.Deployment -Publisher $t.Publisher `
-            -Messages $msgs -PriceTable $inlinePrices -MaxTokens 16 -TenantTag "tenant-$($t.Publisher)" -Stream
-    }
-
-    $inlineResults | Where-Object { $_ } |
-        Format-Table Provider, Deployment, Streamed, InputTokens, CachedTokens, OutputTokens, Reasoning, TotalTokens, CostUSD, TtftMs -AutoSize
-}
-
-Write-Host "=== 1. MODEL CATALOG (real time) ===" -ForegroundColor Cyan
-$catalog = Get-FoundryModelCatalog -SubscriptionId $SubscriptionId -Region $Region -Token $token
-Write-Host "$($catalog.Count) distinct models in $Region"
-$catalog | Select-Object -First 5 Name, Version, Lifecycle, Skus | Format-Table -AutoSize
-
-Write-Host "=== 2. UNIT PRICING (cache daily) ===" -ForegroundColor Cyan
-# NOTE serviceName = 'Foundry Models'. The old 'Cognitive Services' value
-# returns HTTP 200 with zero rows - a silent failure, not an error.
-$prices = Get-AzureRetailPrices -Filter "serviceName eq 'Foundry Models' and armRegionName eq '$Region' and contains(meterName,'Tokens')"
-Write-Host "$($prices.Count) token meters in $Region"
-$prices | Where-Object { $_.MeterName -match 'glbl' } |
-    Sort-Object MeterName | Select-Object -First 8 MeterName, UnitOfMeasure, RetailPrice, PricePer1M |
-    Format-Table -AutoSize
-
-Write-Host "=== 3. TOKEN USAGE - AZURE MONITOR (preferred source, all publishers) ===" -ForegroundColor Cyan
-$usage = Get-TokenUsage -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
-                        -AccountName $AccountName -Token $token -LookbackMins $LookbackMins
-Write-Host "$($usage.Count) datapoints in the last $LookbackMins min"
-
-# Group by publisher as well as deployment. This is the view that proves the
-# point: one query, one schema, every publisher - including Anthropic, which has
-# no per-model cost meter anywhere else.
-$pubByDeployment = @{}
-foreach ($d in $deployments) { $pubByDeployment[$d.Deployment] = $d.Publisher }
-
-$usage | Group-Object Deployment |
-    Select-Object @{n='Deployment';e={$_.Name}},
-                  @{n='Publisher';e={ if ($pubByDeployment[$_.Name]) { $pubByDeployment[$_.Name] } else { 'unknown' } }},
-                  @{n='Datapoints';e={$_.Count}},
-                  @{n='InputTokens';e={($_.Group | Where-Object Metric -eq 'InputTokens'  | Measure-Object Total -Sum).Sum}},
-                  @{n='OutputTokens';e={($_.Group | Where-Object Metric -eq 'OutputTokens' | Measure-Object Total -Sum).Sum}},
-                  @{n='TotalTokens';e={($_.Group | Where-Object Metric -eq 'TotalTokens'  | Measure-Object Total -Sum).Sum}} |
-    Sort-Object TotalTokens -Descending | Select-Object -First 12 | Format-Table -AutoSize
-
-$publishersSeen = $usage | ForEach-Object { $pubByDeployment[$_.Deployment] } |
-                  Where-Object { $_ } | Sort-Object -Unique
-if ($publishersSeen) {
-    Write-Host ("Publishers covered by this single Monitor query: {0}" -f ($publishersSeen -join ', ')) -ForegroundColor DarkGray
-}
-
-Write-Host "=== 4. NEAR-REAL-TIME COST (Monitor tokens x cached price) ===" -ForegroundColor Cyan
-# Derive rates from the real price table rather than hardcoding them. Hardcoded
-# rates in a cost path are the thing this repo exists to argue against, so the
-# demo should not do it either.
-$builder = Join-Path $PSScriptRoot 'Build-FoundryPriceTable.ps1'
-$priceTable = @{}
-$ccuModels  = @{}
-if (Test-Path $builder) {
-    . $builder
-    $pt = Build-FoundryPriceTable -Region $Region
-    # Resolve the real publisher per model. Hardcoding 'OpenAI' made Claude
-    # traffic come back Ambiguous instead of BilledOutsideRetailAPI, which hides
-    # the fact that Anthropic bills through Marketplace and is not in this table.
-    $pubOf = @{}
-    $verOf = @{}
-    foreach ($c in $catalog) {
-        if ($c.Name -and -not $pubOf.ContainsKey($c.Name)) {
-            $pubOf[$c.Name] = $c.Publisher
-            $verOf[$c.Name] = $c.Version
+    $aiToken = Get-EntraToken -Resource 'https://cognitiveservices.azure.com' -SubscriptionId $SubscriptionId
+    $msgs    = @(@{ role = 'user'; content = 'Reply with exactly: ok' })
+    $inline  = @(foreach ($t in $targets) {
+        foreach ($s in $false, $true) {
+            Invoke-MeteredCompletion -Endpoint $endpoint -Deployment $t.Deployment -Publisher $t.Publisher `
+                -Messages $msgs -PriceEntry $priceOf[$t.Deployment] -MaxTokens 16 -Stream:$s `
+                -Token $aiToken -TenantTag "tenant-$($t.Publisher)"
         }
-    }
-    # The live deployment list is more authoritative than the regional catalog
-    # for models actually in use, and it is the only source that covers a model
-    # the catalog has already rotated out.
-    foreach ($d in $deployments) {
-        if ($d.Model -and -not $pubOf.ContainsKey($d.Model)) {
-            $pubOf[$d.Model] = $d.Publisher
-            $verOf[$d.Model] = $d.Version
-        }
-    }
+    }) | Where-Object { $_ }
 
-    foreach ($m in ($usage | Select-Object -ExpandProperty Model -Unique | Where-Object { $_ })) {
-        $pub = $pubOf[$m]
-        if (-not $pub) { Write-Warning "Model '$m' not in the $Region catalog; cannot resolve publisher. Skipping."; continue }
-
-        # Anthropic is absent from the Retail Prices API BY DESIGN - Claude bills
-        # through Azure Marketplace in Claude Consumption Units, and Cost
-        # Management exposes a single CCU meter with no per-model dimension.
-        # Derived cost is therefore impossible for Claude, not merely missing.
-        # Say so explicitly instead of emitting a generic "no price" warning that
-        # looks like a bug to fix.
-        if ($pub -eq 'Anthropic') {
-            $ccuModels[$m] = $true
-            Write-Host ("  {0} [Anthropic] bills in CCU via Azure Marketplace - per-model cost is not derivable. Tokens are still exact. See https://aka.ms/ccu-pricing" -f $m) -ForegroundColor DarkYellow
-            continue
-        }
-
-        $lookup = @{ Table = $pt; ModelName = $m; Publisher = $pub; Sku = 'GlobalStandard' }
-        if ($verOf[$m]) { $lookup.ModelVersion = $verOf[$m] }
-        $in  = Get-TokenPrice @lookup -Kind Input
-        $out = Get-TokenPrice @lookup -Kind Output
-        # The newest models have no Standard context tier. Retry in the Short
-        # band rather than reporting a false coverage gap.
-        if ($in.Status -eq 'NoMeter' -or $out.Status -eq 'NoMeter') {
-            $inS  = Get-TokenPrice @lookup -Kind Input  -ContextTier Short
-            $outS = Get-TokenPrice @lookup -Kind Output -ContextTier Short
-            if ($inS.Status -eq 'Priced' -and $outS.Status -eq 'Priced') { $in = $inS; $out = $outS }
-        }
-        if ($in.Status -eq 'Priced' -and $out.Status -eq 'Priced') {
-            $priceTable[$m] = @{ InputPer1M = $in.PricePer1M; OutputPer1M = $out.PricePer1M }
-        }
-        else {
-            # Deliberately leave the model out. A missing entry yields a null
-            # cost downstream; inventing a rate would yield a confident wrong one.
-            Write-Warning "No usable price for '$m' [$pub] (in=$($in.Status), out=$($out.Status)). Cost will be null, not zero."
-        }
+    $inline | Format-Table Provider, Deployment, Streamed,
+        @{ n = 'Tier';      e = { $_.ServiceTier } },
+        @{ n = 'In';        e = { $_.InputTokens } },
+        @{ n = 'Cached';    e = { $_.CachedTokens } },
+        @{ n = 'Out';       e = { $_.OutputTokens } },
+        @{ n = 'Reasoning'; e = { $_.Reasoning } },
+        @{ n = 'CostUSD';   e = { Format-Number $_.CostUSD } },
+        @{ n = 'Ms';        e = { $_.WallClockMs } },
+        @{ n = 'TTFT';      e = { $_.EngineTtftMs } } -AutoSize
+    foreach ($r in $inline) {
+        $tail = if ($r.CostNote) { " $($r.CostNote)" } else { '' }
+        Write-Host ("  {0} ({1}) served by {2}, apim-request-id {3}.{4}" -f $r.Deployment, $(if ($r.Streamed) { 'stream' } else { 'non-stream' }), $r.ServedModel, $r.RequestId, $tail) -ForegroundColor DarkGray
     }
 }
-else {
-    Write-Warning "Build-FoundryPriceTable.ps1 not found alongside this script. Skipping cost estimation rather than hardcoding rates."
-}
-Get-NearRealTimeCost -Usage $usage -PriceTable $priceTable -CcuModels $ccuModels |
-    Sort-Object InputTokens -Descending | Select-Object -First 12 | Format-Table -AutoSize
 
+# ---- 4 ----
+Write-Host "`n=== 4. TOKEN USAGE (Azure Monitor, last $LookbackMins min; about 1 min behind) ===" -ForegroundColor Cyan
+if (-not $SkipInference) { Write-Host "Section 3's requests reach Monitor about a minute after they complete." -ForegroundColor DarkGray }
+$usage = @(Get-TokenUsage -ResourceId $accountId -Token $armToken -LookbackMins $LookbackMins)
+# Failed requests (429, 404, ...) are counted apart. Version is the one that
+# successful requests ran on: on model-router the token metrics carry the
+# router's own version, whichever model served.
+$usage | Where-Object Metric -in 'InputTokens', 'OutputTokens', 'TotalTokens', 'ModelRequests' |
+    Group-Object Deployment, Model | ForEach-Object {
+        $g = $_.Group
+        $sum = { param($m) [long](($g | Where-Object Metric -eq $m | Measure-Object Total -Sum).Sum) }
+        $ok  = @($g | Where-Object { $_.Metric -eq 'ModelRequests' -and (-not $_.StatusCode -or "$($_.StatusCode)" -like '2*') })
+        $okN = [long](($ok | Measure-Object Total -Sum).Sum)
+        [pscustomobject]@{
+            Deployment = $g[0].Deployment
+            Model      = $g[0].Model
+            Version    = (@($ok.Version | Where-Object { $_ -and $_ -ne '__Empty' } | Sort-Object -Unique) -join ',')
+            Requests   = $okN
+            Failed     = (& $sum 'ModelRequests') - $okN
+            Input      = & $sum 'InputTokens'
+            Output     = & $sum 'OutputTokens'
+            Total      = & $sum 'TotalTokens'
+            # Large for xAI: reasoning Azure did not bill. Elsewhere 0 or a
+            # small skew of either sign (see section 4's notes).
+            Residual   = (& $sum 'TotalTokens') - (& $sum 'InputTokens') - (& $sum 'OutputTokens')
+        }
+    } | Sort-Object Input -Descending | Format-Table -AutoSize
+foreach ($g in ($usage | Where-Object Metric -notin 'InputTokens', 'OutputTokens', 'TotalTokens', 'ModelRequests' | Group-Object Metric)) {
+    $parts = $g.Group | Group-Object Deployment, ServiceTier | ForEach-Object {
+        $label = if ($_.Group[0].ServiceTier) { "$($_.Group[0].Deployment) ($($_.Group[0].ServiceTier))" } else { $_.Group[0].Deployment }
+        "$label $(($_.Group | Measure-Object Total -Sum).Sum)"
+    }
+    Write-Host "  $($g.Name): $($parts -join '; ')" -ForegroundColor DarkGray
+}
+
+# ---- 5 ----
+Write-Host "`n=== 5. NEAR-REAL-TIME COST (Monitor tokens x list prices) ===" -ForegroundColor Cyan
+$nrt = @(Get-NearRealTimeCost -Usage $usage -PriceOf $priceOf -PublisherOfDeployment $publisherOfDeployment |
+         Sort-Object InputTokens -Descending)
+$nrt | Format-Table Deployment, Model, Version, Publisher,
+    @{ n = 'Input';      e = { $_.InputTokens } },
+    @{ n = 'Output';     e = { $_.OutputTokens } },
+    @{ n = 'EstCostUSD'; e = { Format-Number $_.EstCostUSD } },
+    @{ n = 'Billing';    e = { $_.BillingModel } } -AutoSize
+foreach ($r in $nrt) {
+    $extra = @()
+    if ($r.TierSplit) { $extra += "tiers (prompt/generated): $($r.TierSplit)." }
+    if ($r.CacheReadTokens -or $r.CacheWriteTokens) { $extra += "cache read $($r.CacheReadTokens), cache write $($r.CacheWriteTokens)." }
+    if ($r.Note) { $extra += $r.Note }
+    if ($extra) { Write-Host "  $($r.Deployment) / $($r.Model): $($extra -join ' ')" -ForegroundColor DarkGray }
+}
+$seen = @($nrt.Publisher | Where-Object { $_ } | Sort-Object -Unique)
+if ($seen) { Write-Host "Publishers in this one Monitor query: $($seen -join ', ')" -ForegroundColor DarkGray }
+
+# ---- 6 ----
 if ($IncludeCost) {
-    Write-Host "=== 5. BILLED COST (hours lag, throttled) ===" -ForegroundColor Cyan
-    Write-Host "Anthropic appears here only as an aggregate CCU meter, never per Claude model." -ForegroundColor DarkGray
-    Get-BilledCost -SubscriptionId $SubscriptionId -Token $token -Days 5 | Format-Table -AutoSize
+    Write-Host "`n=== 6. BILLED COST (Cost Management; hours behind, throttled) ===" -ForegroundColor Cyan
+    Write-Host "Last 5 UTC days plus today. Claude bills on Marketplace SaaS resources, tied to this account by its internalId - never per deployment." -ForegroundColor DarkGray
+    $billed = @(Get-BilledCost -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -AccountResourceId $accountId -AccountInternalId $account.properties.internalId -Token $armToken -Days 5)
+    foreach ($src in ($billed | Group-Object Source)) {
+        Write-Host "$($src.Name), top 30 rows by cost:"
+        $top = $src.Group | Sort-Object { [double]$_.Cost } -Descending | Select-Object -First 30
+        $cols = @(@{ n = 'Cost'; e = { Format-Number $_.Cost } }, 'Currency', @{ n = 'Quantity'; e = { Format-Number $_.Quantity } }, 'Unit', 'Meter')
+        if ($src.Group[0].Deployment) { $top | Format-Table (@('Deployment') + $cols) -AutoSize }
+        # SaaS resource and meter names run past 60 characters: a table per resource.
+        else { $top | Sort-Object Resource | Format-Table $cols -GroupBy Resource -AutoSize -Wrap }
+    }
+    foreach ($g in ($billed | Group-Object Source, Currency)) {
+        $sum = ($g.Group | Measure-Object Cost -Sum).Sum
+        Write-Host ("  {0}: {1} {2} across {3} rows (quantities are not added: units differ by meter)." -f $g.Group[0].Source, (Format-Number ([math]::Round([double]$sum, 2))), $g.Group[0].Currency, $g.Count) -ForegroundColor DarkGray
+    }
 }
-
